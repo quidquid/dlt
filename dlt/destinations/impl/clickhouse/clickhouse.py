@@ -40,6 +40,7 @@ from dlt.destinations.impl.clickhouse.typing import (
     CODEC_HINT,
     HINT_TO_CLICKHOUSE_ATTR,
     PARTITION_HINT,
+    LOW_CARDINALITY_HINT,
     SETTINGS_HINT,
     SORT_HINT,
     TABLE_ENGINE_TYPE_TO_CLICKHOUSE_ATTR,
@@ -367,6 +368,9 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
             if is_nullable_column(c)
             else self.type_mapper.to_destination_type(c, table)
         )
+
+        if low_cardinality := c.get(LOW_CARDINALITY_HINT):
+            type_with_nullability_modifier = f"LowCardinality({type_with_nullability_modifier})"
 
         return (
             f"{self.sql_client.escape_column_name(c['name'])} {type_with_nullability_modifier} {hints_}"

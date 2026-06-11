@@ -13,6 +13,7 @@ from dlt.destinations.impl.clickhouse.typing import (
     SORT_HINT,
     TABLE_ENGINE_TYPES,
     TABLE_ENGINE_TYPE_HINT,
+    LOW_CARDINALITY_HINT,
     TColumnCodecs,
     TMergeTreeSettings,
     TSQLExprOrColumnSeq,
@@ -31,6 +32,7 @@ def clickhouse_adapter(
     partition: Optional[TSQLExprOrColumnSeq] = None,
     settings: Optional[TMergeTreeSettings] = None,
     codecs: Optional[TColumnCodecs] = None,
+    low_cardinality: Optional[TSQLExprOrColumnSeq] = None,
 ) -> DltResource:
     """Adapts the given data by applying Clickhouse-specific hints.
 
@@ -127,6 +129,12 @@ def clickhouse_adapter(
     if partition:
         additional_table_hints[PARTITION_HINT] = partition
         columns = set_column_hints_from_table_hint(columns, partition, "partition")
+
+    # low cardinality
+    raise_if_not_none_str_seq(low_cardinality, "low_cardinality")
+    if low_cardinality:
+        additional_table_hints[LOW_CARDINALITY_HINT] = low_cardinality
+        columns = set_column_hints_from_table_hint(columns, low_cardinality, "low_cardinality")
 
     # settings
     raise_if_not_none_dict(settings, "settings")
