@@ -19,6 +19,7 @@ from dlt.destinations.impl.clickhouse.typing import (
     PARTITION_HINT,
     SETTINGS_HINT,
     SORT_HINT,
+    LOW_CARDINALITY_HINT,
     TDeployment,
     TSQLExprOrColumnSeq,
 )
@@ -265,6 +266,37 @@ def test_clickhouse_adapter_partition(
     sql_client = cast(ClickHouseSqlClient, pipe.sql_client())
     partition_key = get_partition_key(sql_client, table_name=res.name)
     assert partition_key == expected_partition_key
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["clickhouse"]),
+    ids=lambda x: x.name,
+)
+def test_clickhouse_adapter_low_cardinality(
+    destination_config: DestinationTestConfiguration,
+    clickhouse_adapter_resource: DltResource,
+) -> None:
+    res = clickhouse_adapter(clickhouse_adapter_resource, low_cardinality=["town"])
+    table_schema = res.compute_table_schema()
+
+    # table hint gets set correctly
+    assert table_schema[LOW_CARDINALITY_HINT] == ["town"]  # type: ignore[typeddict-item]
+
+    # column hints get set correctly
+    for col in table_schema["columns"].values():
+        assert col.get(LOW_CARDINALITY_HINT) is (True if col["name"] == "town" else None)
+
+    pipe = destination_config.setup_pipeline("test_clickhouse_adapter_low_cardinality", dev_mode=True)
+    client = cast(ClickHouseClient, pipe.destination_client())
+
+    # DDL generation wraps column type in LowCardinality and Nullable
+    table_schema = client.schema.update_table(table_schema)
+    new_columns = list(table_schema["columns"].values())
+    stmts = client._get_table_update_sql("data", new_columns, False)
+    assert len(stmts) == 1
+    sql = stmts[0]
+    assert "LowCardinality(Nullable(" in sql
 
 
 @pytest.mark.parametrize(
@@ -566,6 +598,30 @@ def test_set_column_hints_from_table_hint(table_hint: TSQLExprOrColumnSeq) -> No
     assert c3.get("sort") is True  # set (rule 1)
     assert c1.get("nullable") is True  # retained (rule 4)
     assert c2.get("nullable") is False  # set (rule 2)
+    assert c3.get("nullable") is True  # retained, despite being part of table hint (rule 4)
+
+
+@pytest.mark.parametrize(
+    "table_hint",
+    (
+        pytest.param(["c2", "c3"], id="seq"),
+        pytest.param("(upper(c2), c3)", id="expr"),
+    ),
+)
+def test_set_column_hints_from_table_hint_low_cardinality(table_hint: TSQLExprOrColumnSeq) -> None:
+    c1: TColumnSchema = {"name": "c1", "data_type": "text", "nullable": True, LOW_CARDINALITY_HINT: True}  # type: ignore[misc]
+    c2: TColumnSchema = {"name": "c2", "data_type": "text", LOW_CARDINALITY_HINT: False}  # type: ignore[misc]
+    c3: TColumnSchema = {"name": "c3", "data_type": "text", "nullable": True}
+
+    columns: TTableSchemaColumns = {"c1": c1, "c2": c2, "c3": c3}
+
+    set_column_hints_from_table_hint(columns, table_hint, hint_name=LOW_CARDINALITY_HINT)
+
+    assert c1.get(LOW_CARDINALITY_HINT) is None  # removed (rule 3)
+    assert c2.get(LOW_CARDINALITY_HINT) is True  # overridden (rule 1)
+    assert c3.get(LOW_CARDINALITY_HINT) is True  # set (rule 1)
+    assert c1.get("nullable") is True  # retained (rule 4)
+    assert c2.get("nullable") is None  # not forced to False for low cardinality!
     assert c3.get("nullable") is True  # retained, despite being part of table hint (rule 4)
 
 

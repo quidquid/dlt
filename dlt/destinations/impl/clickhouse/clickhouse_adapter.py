@@ -134,7 +134,7 @@ def clickhouse_adapter(
     raise_if_not_none_str_seq(low_cardinality, "low_cardinality")
     if low_cardinality:
         additional_table_hints[LOW_CARDINALITY_HINT] = low_cardinality
-        columns = set_column_hints_from_table_hint(columns, low_cardinality, "low_cardinality")
+        columns = set_column_hints_from_table_hint(columns, low_cardinality, LOW_CARDINALITY_HINT)
 
     # settings
     raise_if_not_none_dict(settings, "settings")
@@ -169,7 +169,7 @@ def get_column_names_from_table_hint(hint: TSQLExprOrColumnSeq) -> Set[str]:
 def set_column_hints_from_table_hint(
     columns: TTableSchemaColumns,
     hint: TSQLExprOrColumnSeq,
-    hint_name: Literal["sort", "partition"],
+    hint_name: Literal["sort", "partition", "x-clickhouse-low-cardinality"],
 ) -> TTableSchemaColumns:
     """Sets column hints based on provided table hint.
 
@@ -177,12 +177,13 @@ def set_column_hints_from_table_hint(
 
     When it's a `sort` table hint, it sets `sort` column hints.
     When it's a `partition` table hint, it sets `partition` column hints.
+    When it's a `low_cardinality` table hint, it sets `x-clickhouse-low-cardinality` column hints.
 
     Principles: table hint takes precedence over column hints.
 
     Rules:
     1. sets/overrides column hint to True for each column in table hint, even if user provided False
-    2. sets nullability to False for each column in table hint, unless user provided nullable=True
+    2. sets nullability to False for each column in table hint, unless user provided nullable=True (skipped for low cardinality)
     3. removes column hint if it's set to True but not in table hint
     4. retains any user-provided nullability
     """
@@ -195,11 +196,14 @@ def set_column_hints_from_table_hint(
             columns[name][hint_name] = True
 
             # rule 2
-            if columns[name].get("nullable") is not True:
+            if hint_name != LOW_CARDINALITY_HINT and columns[name].get("nullable") is not True:
                 columns[name]["nullable"] = False
         else:  # new column
             # rules 1 and 2
-            columns[name] = {"name": name, "nullable": False, hint_name: True}  # type: ignore[misc]
+            if hint_name == LOW_CARDINALITY_HINT:
+                columns[name] = {"name": name, "nullable": True, hint_name: True}  # type: ignore[misc]
+            else:
+                columns[name] = {"name": name, "nullable": False, hint_name: True}  # type: ignore[misc]
 
     # rule 3
     for col in columns.values():
