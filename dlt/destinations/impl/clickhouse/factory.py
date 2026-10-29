@@ -71,6 +71,9 @@ class ClickHouseTypeMapper(TypeMapperImpl):
     def from_destination_type(
         self, db_type: str, precision: Optional[int] = None, scale: Optional[int] = None
     ) -> TColumnType:
+        # Remove "LowCardinality" wrapper.
+        db_type = re.sub(r"^LowCardinality\((?P<type>.+)\)$", r"\g<type>", db_type)
+
         # Remove "Nullable" wrapper.
         db_type = re.sub(r"^Nullable\((?P<type>.+)\)$", r"\g<type>", db_type)
 

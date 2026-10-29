@@ -44,3 +44,4 @@ PARTITION_HINT: Literal["x-clickhouse-partition"] = "x-clickhouse-partition"
 SETTINGS_HINT: Literal["x-clickhouse-settings"] = "x-clickhouse-settings"
 CODEC_HINT: Literal["x-clickhouse-codec"] = "x-clickhouse-codec"
 EXCHANGE_CAPABLE_DATABASE_ENGINES: Tuple[str, ...] = ("Atomic", "Replicated", "Shared")
+LOW_CARDINALITY_HINT: Literal["x-clickhouse-low-cardinality"] = "x-clickhouse-low-cardinality"
