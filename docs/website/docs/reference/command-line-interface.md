@@ -1,5 +1,6 @@
 ---
-title: Command Line Interface
+title: dlt CLI reference
+sidebar_label: Command Line Interface
 description: Command line interface (CLI) full reference of dlt
 keywords: [command line interface, cli, dlt init]
 ---
@@ -7,7 +8,7 @@ keywords: [command line interface, cli, dlt init]
 
 # Command Line Interface Reference
 
-<!-- this page is fully generated from the argparse object of dlt, run make update-cli-docs to update it -->
+<!-- this page is fully generated from the argparse object of dlt, do not edit -->
 
 This page contains all commands available in the dlt CLI and is generated
 automatically from the fully populated python argparse object of dlt.
@@ -28,7 +29,7 @@ Adding the flag after the pipeline keyword will not work.
 Creates, adds, inspects and deploys dlt pipelines. Further help is available at https://dlthub.com/docs/reference/command-line-interface.
 
 **Usage**
-```sh
+```cli
 dlt [-h] [-v] [--non-interactive] [-y] [--debug] [--version]
     [--disable-telemetry] [--enable-telemetry] [--no-pwd]
     {telemetry,schema,pipeline,init,deploy,dashboard,ai} ...
@@ -56,7 +57,7 @@ dlt [-h] [-v] [--non-interactive] [-y] [--debug] [--version]
 * [`init`](#dlt-init) - Creates a pipeline in the current folder by adding existing verified source or creating a new one from template.
 * [`deploy`](#dlt-deploy) - Creates a deployment package for a selected pipeline script
 * [`dashboard`](#dlt-dashboard) - Shows the dlthub workspace dashboard
-* [`ai`](#dlt-ai) - Moved to `dlthub ai` (run `pip install dlt[hub]`)
+* [`ai`](#dlt-ai) - Moved to `dlthub ai` (run `pip install dlt\[hub]`)
 
 </details>
 
@@ -65,7 +66,7 @@ dlt [-h] [-v] [--non-interactive] [-y] [--debug] [--version]
 Shows telemetry status.
 
 **Usage**
-```sh
+```cli
 dlt telemetry [-h]
 ```
 
@@ -89,7 +90,7 @@ Inherits arguments from [`dlt`](#dlt).
 Shows, converts and upgrades schemas.
 
 **Usage**
-```sh
+```cli
 dlt schema [-h] [--format {json,yaml,dbml,dot,mermaid}] [--remove-defaults] file
 ```
 
@@ -118,10 +119,10 @@ Inherits arguments from [`dlt`](#dlt).
 Inspects pipeline state, trace, load packages, provides basic maintenance.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [-h] [--list-pipelines] [--pipelines-dir PIPELINES_DIR]
     [pipeline_name]
-    {info,show,failed-jobs,drop-pending-packages,sync,trace,schema,drop,load-package,mcp}
+    {info,show,failed-jobs,drop-pending-packages,abort-packages,sync,trace,schema,drop,load-package,mcp}
     ...
 ```
 
@@ -147,12 +148,13 @@ Inherits arguments from [`dlt`](#dlt).
 * [`info`](#dlt-pipeline-info) - Displays state of the pipeline, use -v or -vv for more info
 * [`show`](#dlt-pipeline-show) - Generates and launches workspace dashboard with the loading status and dataset explorer
 * [`failed-jobs`](#dlt-pipeline-failed-jobs) - Displays information on all the failed loads in all completed packages, failed jobs and associated error messages
-* [`drop-pending-packages`](#dlt-pipeline-drop-pending-packages) - Deletes all extracted and normalized packages including those that are partially loaded.
+* [`drop-pending-packages`](#dlt-pipeline-drop-pending-packages) - [deprecated: use abort-packages] deletes all extracted and normalized packages including those that are partially loaded.
+* [`abort-packages`](#dlt-pipeline-abort-packages) - Safely cancels pending loads: marks packages as aborted, records failed jobs, then resyncs pipeline state from the destination.
 * [`sync`](#dlt-pipeline-sync) - Drops the local state of the pipeline and resets all the schemas and restores it from destination. the destination state, data and schemas are left intact.
 * [`trace`](#dlt-pipeline-trace) - Displays last run trace, use -v or -vv for more info
 * [`schema`](#dlt-pipeline-schema) - Displays default schema
 * [`drop`](#dlt-pipeline-drop) - Selectively drop tables and reset state
-* [`load-package`](#dlt-pipeline-load-package) - Displays information on load package, use -v or -vv for more info
+* [`load-package`](#dlt-pipeline-load-package) - Displays information on a load package or acts on it (abort, fail-job, ...).
 * [`mcp`](#dlt-pipeline-mcp) - Launch mcp server attached to this pipeline
 
 </details>
@@ -162,7 +164,7 @@ Inherits arguments from [`dlt`](#dlt).
 Displays state of the pipeline, use -v or -vv for more info.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] info [-h]
 ```
 
@@ -188,7 +190,7 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 Generates and launches workspace dashboard with the loading status and dataset explorer.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] show [-h] [--edit]
 ```
 
@@ -219,7 +221,7 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 Displays information on all the failed loads in all completed packages, failed jobs and associated error messages.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] failed-jobs [-h]
 ```
 
@@ -241,14 +243,17 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 
 ### `dlt pipeline drop-pending-packages`
 
-Deletes all extracted and normalized packages including those that are partially loaded.
+[Deprecated: use abort-packages] Deletes all extracted and normalized packages including those that are partially loaded.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] drop-pending-packages [-h]
 ```
 
 **Description**
+
+DEPRECATED: use `abort-packages` instead. That command properly records failed jobs
+and resyncs pipeline state from the destination.
 
 Removes all extracted and normalized packages in the pipeline's working dir.
 `dlt` keeps extracted and normalized load packages in the pipeline working directory. When the `run` method is called, it will attempt to normalize and load
@@ -266,12 +271,41 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 
 </details>
 
+### `dlt pipeline abort-packages`
+
+Safely cancels pending loads: marks packages as aborted, records failed jobs, then resyncs pipeline state from the destination.
+
+**Usage**
+```cli
+dlt pipeline [pipeline_name] abort-packages [-h]
+```
+
+**Description**
+
+Use this when a load is stuck or you want to discard pending work without losing track of what
+happened. The oldest normalized package (the one being loaded) is aborted: its retry/pending
+jobs move to failed_jobs so they stay visible in `failed-jobs` output and the package completes
+as aborted. All other pending packages, extracted ones included, are deleted. It then
+restores local pipeline state and schemas from the snapshot
+taken when the oldest pending package started and you can safely re-extract and re-run.
+
+<details>
+
+<summary>Show Arguments and Options</summary>
+
+Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
+
+**Options**
+* `-h, --help` - Show this help message and exit
+
+</details>
+
 ### `dlt pipeline sync`
 
 Drops the local state of the pipeline and resets all the schemas and restores it from destination. The destination state, data and schemas are left intact.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] sync [-h] [--destination DESTINATION]
     [--dataset-name DATASET_NAME]
 ```
@@ -305,7 +339,7 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 Displays last run trace, use -v or -vv for more info.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] trace [-h]
 ```
 
@@ -332,7 +366,7 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 Displays default schema.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] schema [-h] [--format {json,yaml,dbml,dot,mermaid}]
     [--remove-defaults]
 ```
@@ -359,7 +393,7 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 Selectively drop tables and reset state.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] drop [-h] [--destination DESTINATION]
     [--dataset-name DATASET_NAME] [--drop-all] [--state-paths [STATE_PATHS ...]]
     [--schema SCHEMA_NAME] [--state-only] [resources ...]
@@ -462,20 +496,22 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 
 ### `dlt pipeline load-package`
 
-Displays information on load package, use -v or -vv for more info.
+Displays information on a load package or acts on it (abort, fail-job, ...).
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] load-package [-h] [load-id]
+    [{info,row-counts,abort,job,fail-job}] [job]
 ```
 
 **Description**
 
-Shows information on a load package with a given `load_id`. The `load_id` parameter defaults to the
-most recent package. Package information includes its state (`COMPLETED/PROCESSED`) and list of all
-jobs in a package with their statuses, file sizes, types, and in case of failed jobs—the error
-messages from the destination. With the verbose flag set (`-v`), you can also see the
-list of all tables and columns created at the destination during the loading of that package.
+Shows information on a load package with a given `load_id`, or runs an action on it. The `load_id`
+parameter defaults to the most recent package. Package information includes its state
+(`COMPLETED/PROCESSED`) and list of all jobs in a package with their statuses, file sizes, types,
+and in case of failed jobs—the error messages from the destination. With the verbose flag set
+(`-v`), you can also see the list of all tables and columns created at the destination during the
+loading of that package.
 
 <details>
 
@@ -485,6 +521,7 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 
 **Positional arguments**
 * `load-id` - Load id of completed or normalized package. defaults to the most recent package.
+* `job` - Pattern for the `job` action, or job id / file name for `fail-job`.
 
 **Options**
 * `-h, --help` - Show this help message and exit
@@ -496,9 +533,9 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 Launch MCP server attached to this pipeline.
 
 **Usage**
-```sh
+```cli
 dlt pipeline [pipeline_name] mcp [-h] [--stdio] [--sse] [--port PORT]
-    [--features [FEATURES ...]]
+    [--features [FEATURES ...]] [--no-default-features] [--access ACCESS]
 ```
 
 **Description**
@@ -517,6 +554,8 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 * `--sse` - Use legacy sse transport instead of streamable-http
 * `--port PORT` - Port for the mcp server (default: 43656)
 * `--features [FEATURES ...]` - Mcp features to enable/disable. default: context, pipeline, secrets, toolkit, workspace. use +name to add, -name to remove (e.g. --features=-secrets,+context)
+* `--no-default-features` - Serve only the features named by --features, without the defaults above
+* `--access ACCESS` - Access the caller was granted, as `axis:verb,verb` pairs (e.g. data:read,local:read). tools requiring more are not served. `axis:` alone grants nothing on that axis. everything is served when omitted.
 
 </details>
 
@@ -525,7 +564,7 @@ Inherits arguments from [`dlt pipeline`](#dlt-pipeline).
 Creates a pipeline in the current folder by adding existing verified source or creating a new one from template.
 
 **Usage**
-```sh
+```cli
 dlt init [-h] [--list-sources] [--list-destinations] [--location LOCATION]
     [--branch BRANCH] [--eject] [source] [destination]
 ```
@@ -569,7 +608,7 @@ Inherits arguments from [`dlt`](#dlt).
 Creates a deployment package for a selected pipeline script.
 
 **Usage**
-```sh
+```cli
 dlt deploy [-h] pipeline-script-path {github-action,airflow-composer} ...
 ```
 
@@ -600,7 +639,7 @@ Inherits arguments from [`dlt`](#dlt).
 Deploys the pipeline to Github Actions.
 
 **Usage**
-```sh
+```cli
 dlt deploy pipeline-script-path github-action [-h] [--location LOCATION]
     [--branch BRANCH] --schedule SCHEDULE [--run-manually] [--run-on-push]
 ```
@@ -640,7 +679,7 @@ Inherits arguments from [`dlt deploy`](#dlt-deploy).
 Deploys the pipeline to Airflow.
 
 **Usage**
-```sh
+```cli
 dlt deploy pipeline-script-path airflow-composer [-h] [--location LOCATION]
     [--branch BRANCH] [--secrets-format {env,toml}]
 ```
@@ -676,7 +715,7 @@ Inherits arguments from [`dlt deploy`](#dlt-deploy).
 Shows the dlthub workspace dashboard.
 
 **Usage**
-```sh
+```cli
 dlt dashboard [-h] [--pipelines-dir PIPELINES_DIR] [--edit]
 ```
 
@@ -704,10 +743,10 @@ Inherits arguments from [`dlt`](#dlt).
 
 ## `dlt ai`
 
-Moved to `dlthub ai` (run `pip install dlt[hub]`).
+Moved to `dlthub ai` (run `pip install dlt\[hub]`).
 
 **Usage**
-```sh
+```cli
 dlt ai [-h]
 ```
 

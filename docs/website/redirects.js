@@ -64,7 +64,11 @@ const REDIRECTS = [
   },
   {
     from: "/docs/visualizations",
-    to: "/docs/general-usage/dataset-access/",
+    to: "/docs/general-usage/dataset-access/dataset",
+  },
+  {
+    from: "/docs/general-usage/dataset-access",
+    to: "/docs/general-usage/dataset-access/dataset",
   },
 
   // top-404 redirects
@@ -89,6 +93,54 @@ const REDIRECTS = [
   {
     from: "/docs/walkthroughs/load-data-from-an-api",
     to: "/docs/tutorial/load-data-from-an-api",
+  },
+  {
+    from: "/docs/walkthroughs/create-a-pipeline",
+    to: "/docs/tutorial/load-data-from-an-api",
+  },
+  {
+    from: "/docs/dlt-ecosystem/table-formats/delta",
+    to: "/docs/dlt-ecosystem/destinations/delta-iceberg",
+  },
+  {
+    from: "/docs/dlt-ecosystem/file-formats/parquet",
+    to: "/docs/dlt-ecosystem/file-formats#parquet",
+  },
+  {
+    from: "/docs/dlt-ecosystem/file-formats/jsonl",
+    to: "/docs/dlt-ecosystem/file-formats#jsonl",
+  },
+  {
+    from: "/docs/dlt-ecosystem/file-formats/csv",
+    to: "/docs/dlt-ecosystem/file-formats#csv",
+  },
+  {
+    from: "/docs/dlt-ecosystem/file-formats/insert-format",
+    to: "/docs/dlt-ecosystem/file-formats#sql-insert",
+  },
+  {
+    from: "/docs/running-in-production/alerting",
+    to: "/docs/running-in-production/running#using-slack-to-send-messages",
+  },
+  {
+    from: "/docs/running-in-production/monitoring",
+    to: "/docs/running-in-production/running",
+  },
+  {
+    from: "/docs/running-in-production/tracing",
+    to: "/docs/running-in-production/running",
+  },
+  {
+    from: "/docs/general-usage/dataset-access/sql-client",
+    to: "/docs/dlt-ecosystem/transformations/sql",
+  },
+  {
+    from: "/docs/general-usage/dataset-access/ibis-backend",
+    to: "/docs/dlt-ecosystem/transformations/python#using-ibis",
+  },
+  {
+    from: "/docs/dlt-ecosystem/table-formats/iceberg",
+    to: "/docs/dlt-ecosystem/destinations/delta-iceberg",
   },
   {
     from: "/docs/load-data-from-an-api",
@@ -116,7 +168,11 @@ const REDIRECTS = [
   },
   {
     from: "/docs/getting-started/build-a-data-pipeline",
-    to: "/docs/build-a-pipeline-tutorial",
+    to: "/docs/tutorial/load-data-from-an-api",
+  },
+  {
+    from: "/docs/build-a-pipeline-tutorial",
+    to: "/docs/tutorial/load-data-from-an-api",
   },
 
   // api_reference paths gained a /dlt/ prefix
@@ -164,7 +220,11 @@ const REDIRECTS = [
   },
   {
     from: "/docs/hub/getting-started/runtime-tutorial",
-    to: "/docs/hub/getting-started/platform-tutorial",
+    to: "/docs/hub/pipeline-operations/deployments",
+  },
+  {
+    from: "/docs/hub/getting-started/platform-tutorial",
+    to: "/docs/hub/pipeline-operations/deployments",
   },
   {
     from: "/docs/hub/workspace/overview",
@@ -265,6 +325,168 @@ const REDIRECTS = [
   {
     from: "/docs/dlt-ecosystem/llm-tooling/explore-and-transform",
     to: "/docs/hub/transformations/explore-and-transform",
+  },
+  // Removed pages that external sites still link to (public backlink crawl,
+  // Sept 2026: rest-client alone is linked from ~100 GitHub repos, many via
+  // the DataTalksClub zoomcamp). Without these they answer 404.
+  {
+    from: "/docs/general-usage/http/rest-client",
+    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced#restclient",
+  },
+  {
+    from: "/docs/general-usage/http/requests",
+    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced#requests-wrapper",
+  },
+  {
+    from: "/docs/general-usage/http/overview",
+    to: "/docs/dlt-ecosystem/verified-sources/rest_api/advanced#restclient",
+  },
+  {
+    from: "/docs/general-usage/dashboard",
+    to: "/docs/hub/ingestion/dashboard",
+  },
+  {
+    // the reference section landing page - the API reference has its own entry below
+    from: "/docs/reference",
+    to: "/docs/reference/command-line-interface",
+  },
+  {
+    from: "/docs/api_reference",
+    to: "/docs/api_reference/dlt/__init__",
+  },
+  {
+    from: "/docs/api_reference/dlt",
+    to: "/docs/api_reference/dlt/__init__",
+  },
+  {
+    from: "/docs/api_reference/sources/sql_database/__init__",
+    to: "/docs/api_reference/dlt/sources/sql_database/__init__",
+  },
+  {
+    from: "/docs/api_reference/helpers/dbt/runner",
+    to: "/docs/api_reference/dlt/helpers/dbt/runner",
+  },
+  {
+    from: "/docs/walkthroughs/add-a-verified-source",
+    to: "/docs/dlt-ecosystem/verified-sources",
+  },
+  {
+    from: "/docs/dlt-ecosystem/verified-sources/filesystem/basic",
+    to: "/docs/dlt-ecosystem/verified-sources/filesystem",
+  },
+  {
+    from: "/docs/performance",
+    to: "/docs/reference/performance",
+  },
+  {
+    from: "/docs/general-usage/performance",
+    to: "/docs/reference/performance",
+  },
+  {
+    from: "/docs/reference/explainers/airflow-gcp-cloud-composer",
+    to: "/docs/walkthroughs/deploy-a-pipeline/deploy-with-airflow-composer",
+  },
+  {
+    from: "/docs/walkthroughs/deploy-a-pipeline/deploy-gcp-cloud-function-as-webhook",
+    to: "/docs/walkthroughs/deploy-a-pipeline/deploy-with-google-cloud-functions",
+  },
+  {
+    from: "/docs/general-usage/dataset-access/transformations",
+    to: "/docs/dlt-ecosystem/transformations",
+  },
+  {
+    from: "/docs/dlt-ecosystem/transformations/dbt/dbt_cloud",
+    to: "/docs/dlt-ecosystem/transformations/dbt#dbt-cloud",
+  },
+  {
+    from: "/docs/general-usage/dataset-access/",
+    to: "/docs/general-usage/dataset-access/dataset",
+  },
+  {
+    from: "/docs/hub/features/ai",
+    to: "/docs/hub/ai-harness/introduction",
+  },
+  {
+    from: "/docs/hub/features/mcp-server",
+    to: "/docs/hub/ai-harness/introduction",
+  },
+  {
+    from: "/docs/plus/features/ai",
+    to: "/docs/hub/ai-harness/introduction",
+  },
+  {
+    from: "/docs/guides/schema-management",
+    to: "/docs/general-usage/schema-evolution",
+  },
+  {
+    from: "/docs/dlt-ecosystem/visualizations/understanding-the-tables",
+    to: "/docs/general-usage/destination-tables",
+  },
+  // pages that moved in earlier docs restructures and currently end on the
+  // not-found page (backlink crawl, Sept 2026)
+  {
+    from: "/docs/general-usage",
+    to: "/docs/general-usage/source",
+  },
+  {
+    from: "/docs/general-usage/dataset-access/streamlit",
+    to: "/docs/hub/cookbook/build-streamlit-dashboard",
+  },
+  {
+    from: "/docs/dlt-ecosystem/verified-sources/filesystem/advanced",
+    to: "/docs/dlt-ecosystem/verified-sources/filesystem",
+  },
+  {
+    from: "/docs/running-in-production",
+    to: "/docs/running-in-production/running",
+  },
+  {
+    from: "/docs/hub/features/data-access",
+    to: "/docs/general-usage/dataset-access/dataset",
+  },
+  {
+    from: "/docs/hub/features/quality/tests",
+    to: "/docs/hub/data-quality",
+  },
+  {
+    from: "/docs/hub/features/transformations/setup",
+    to: "/docs/hub/transformations",
+  },
+  {
+    from: "/docs/hub/features/project/overview",
+    to: "/docs/hub/pipeline-operations/overview",
+  },
+  {
+    from: "/docs/hub/features/project/source-configuration",
+    to: "/docs/hub/pipeline-operations/overview",
+  },
+  {
+    from: "/docs/hub/features/project/python-api",
+    to: "/docs/hub/pipeline-operations/overview",
+  },
+  {
+    from: "/docs/hub/getting-started/tutorial",
+    to: "/docs/hub/getting-started/introduction",
+  },
+  {
+    from: "/docs/hub/getting-started/advanced_tutorial",
+    to: "/docs/hub/getting-started/introduction",
+  },
+  {
+    from: "/docs/hub/core-concepts/profiles",
+    to: "/docs/hub/pipeline-operations/profiles",
+  },
+  {
+    from: "/docs/hub/production/pipeline-runner",
+    to: "/docs/hub/pipeline-operations/deployments",
+  },
+  {
+    from: "/docs/hub/production/observability",
+    to: "/docs/hub/pipeline-operations/monitoring",
+  },
+  {
+    from: "/docs/hub/getting-started/playground-workspace",
+    to: "/docs/hub/pipeline-operations/playground-workspace",
   },
 ];
 

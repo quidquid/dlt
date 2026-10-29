@@ -19,6 +19,7 @@ from dlt.destinations import databricks
 from dlt.destinations.impl.databricks.configuration import (
     DatabricksClientConfiguration,
     DATABRICKS_APPLICATION_ID,
+    SPARK_SESSION_TIMEZONE,
     DatabricksCredentials,
     DatabricksZerobusConfiguration,
     DatabricksZerobusCredentials,
@@ -57,6 +58,31 @@ def test_databricks_credentials_to_connector_params():
     assert displayable_location.startswith(
         "databricks://my-databricks.example.com/sql/1.0/warehouses/asdfe/my-catalog"
     )
+
+
+def test_databricks_session_timezone() -> None:
+    os.environ["CREDENTIALS__SERVER_HOSTNAME"] = "my-databricks.example.com"
+    os.environ["CREDENTIALS__HTTP_PATH"] = "/sql/1.0/warehouses/asdfe"
+    os.environ["CREDENTIALS__ACCESS_TOKEN"] = "my-token"
+    os.environ["CREDENTIALS__CATALOG"] = "my-catalog"
+
+    credentials = resolve_configuration(
+        DatabricksClientConfiguration()._bind_dataset_name(dataset_name="my-dataset")
+    ).credentials
+    # the warehouse default applies unless you configure a timezone
+    assert credentials.to_connector_params()["session_configuration"] == {}
+
+    # only the Spark conf takes effect, the `TIMEZONE` SQL parameter is ignored by the connector
+    credentials.session_timezone = "Europe/Berlin"
+    assert credentials.to_connector_params()["session_configuration"] == {
+        SPARK_SESSION_TIMEZONE: "Europe/Berlin"
+    }
+
+    # a timezone set in `session_configuration` takes precedence
+    credentials.session_configuration = {SPARK_SESSION_TIMEZONE: "Asia/Tokyo"}
+    assert credentials.to_connector_params()["session_configuration"] == {
+        SPARK_SESSION_TIMEZONE: "Asia/Tokyo"
+    }
 
 
 def test_databricks_configuration() -> None:
@@ -364,6 +390,25 @@ def test_notebook_token_overwritten_by_sdk_auth(mock_databricks_env, mocker) -> 
     assert creds.access_token is sdk_authenticator
 
 
+@pytest.mark.parametrize(
+    "credentials,expected_fingerprint",
+    [
+        pytest.param(None, "", id="empty"),
+        pytest.param(
+            DatabricksCredentials(server_hostname="workspace.cloud.databricks.com"),
+            digest128("workspace.cloud.databricks.com"),
+            id="legacy_server_hostname",
+        ),
+    ],
+)
+def test_databricks_fingerprint(
+    credentials: Optional[DatabricksCredentials], expected_fingerprint: str
+) -> None:
+    config = DatabricksClientConfiguration(credentials=credentials)
+
+    assert config.fingerprint() == expected_fingerprint
+
+
 @pytest.mark.parametrize("auth_type", ("pat", "oauth2"))
 def test_default_credentials(auth_type: str) -> None:
     # create minimal default env
@@ -397,9 +442,6 @@ def test_default_credentials(auth_type: str) -> None:
     # "my-dataset-1234" not present (we check SQL execution)
     with bricks.client(Schema("schema"), config) as client:
         assert not client.is_storage_initialized()
-
-    # check fingerprint not default
-    assert config.fingerprint() != digest128("")
 
 
 def test_oauth2_credentials() -> None:

@@ -1,5 +1,5 @@
 import os
-from typing import Any, List
+from typing import Any, List, cast
 
 import humanize
 import pytest
@@ -20,6 +20,7 @@ from tests.pipeline.utils import (
 
 try:
     from dlt.sources.sql_database import TableBackend, sql_database, sql_table
+    from dlt.sources.sql_database.helpers import TSqlDatabaseDataLocation
     from tests.load.sources.sql_database.test_helpers import mock_json_column, mock_array_column
     from tests.load.sources.sql_database.test_sql_database_source import (
         assert_row_counts,
@@ -80,6 +81,44 @@ def test_load_sql_schema_loads_all_tables(
     assert_load_info(load_info)
 
     assert_row_counts(pipeline, postgres_db)
+
+    # every table of the source schema is read by its own resource, which records that one table.
+    # `camelCaseTable` is reflected but kept out of `table_infos`, its name is not queryable
+    # in destinations that normalize identifiers
+    expected_tables = {
+        name for name, info in postgres_db.table_infos.items() if not info["is_view"]
+    } | {"camelCaseTable"}
+    extract_info = pipeline.last_trace.last_extract_info
+    inputs = extract_info.metrics[extract_info.loads_ids[0]][0]["inputs"]
+    assert {location["resource_name"] for location in inputs} == expected_tables
+    assert len(inputs) == len(expected_tables)
+    for location in inputs:
+        assert location["kind"] == "sql_database"
+        sql_location = cast(TSqlDatabaseDataLocation, location)
+        assert sql_location["tables"] == [location["resource_name"]]
+        assert sql_location["db_schema"] == postgres_db.schema
+
+    # and every one of them is written back, attributed to the resource that read it
+    outputs = [
+        location for metrics in load_info.metrics.values() for location in metrics[0]["outputs"]
+    ]
+    written_tables = {
+        table
+        for location in outputs
+        if not location["resource_name"].startswith("_dlt")
+        for table in location["tables"]
+    }
+    assert written_tables == {
+        table["name"] for table in pipeline.default_schema.data_tables(seen_data_only=True)
+    }
+    naming = pipeline.default_schema.naming
+    for location in outputs:
+        assert location["physical_dataset_name"] == load_info.dataset_name
+        # a resource is named after the source table, the written table after normalizing it
+        if location["resource_name"] in expected_tables:
+            assert (
+                naming.normalize_table_identifier(location["resource_name"]) in location["tables"]
+            )
 
 
 @pytest.mark.parametrize(
@@ -174,13 +213,14 @@ def test_load_sql_schema_loads_all_tables_parallel_connectorx_arrow_stream(
     assert pa.types.is_timestamp(col_field.type)
     assert col_field.type.unit == "us"
 
-    # verify all values are millisecond multiples
-    # since arrow_stream returns timestamp columns as date64[ms] and we cast them to
-    # timestamps with microsecond precision
+    # connectorx arrow_stream now returns timestamp columns as timestamp[ns] (older versions
+    # returned date64[ms]); we cast them to timestamp[us]. postgres has microsecond precision,
+    # so it must be preserved here - values are NOT truncated to milliseconds.
     micros = pa.compute.cast(data_["datetime_ntz_col"], pa.int64()).combine_chunks()
     for i in range(len(micros)):
         assert micros[i].is_valid
-        assert micros[i].as_py() % 1000 == 0
+    # at least one value carries sub-millisecond microseconds, proving the precision survived
+    assert any(micros[i].as_py() % 1000 != 0 for i in range(len(micros)))
 
 
 @pytest.mark.parametrize(
@@ -208,6 +248,20 @@ def test_load_sql_table_names(
     assert_load_info(load_info)
 
     assert_row_counts(pipeline, postgres_db, tables)
+
+    # each table resource records the database it read, addressed without credentials
+    extract_info = pipeline.last_trace.last_extract_info
+    inputs = extract_info.metrics[extract_info.loads_ids[0]][0]["inputs"]
+    by_resource = {location["resource_name"]: location for location in inputs}
+    assert set(by_resource) == set(tables)
+    for table in tables:
+        location = cast(TSqlDatabaseDataLocation, by_resource[table])
+        assert location["kind"] == "sql_database"
+        assert location["tables"] == [table]
+        assert location["db_schema"] == postgres_db.schema
+        assert location["database"] == postgres_db.credentials.database
+        assert location["location"].startswith("postgresql://")
+        assert postgres_db.credentials.password not in location["location"]
 
 
 @pytest.mark.parametrize(

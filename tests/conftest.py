@@ -1,12 +1,15 @@
 import os
 import dataclasses
 import logging
-from typing import Dict, List, Any
+from typing import Dict, Iterator, List, Any
 from pathlib import Path
 
 import pytest
 
 # patch which providers to enable
+from dlt.common.time import get_context_timezone, set_context_timezone
+from dlt.common.configuration.container import Container
+from dlt.common.configuration.specs.timezone_context import TimezoneContext
 from dlt.common.configuration.providers import (
     ConfigProvider,
     EnvironProvider,
@@ -118,7 +121,7 @@ def pytest_configure(config):
         "https://telemetry-tracker.services4758.workers.dev"
     )
 
-    delattr(runtime_configuration.RuntimeConfiguration, "__init__")
+    del runtime_configuration.RuntimeConfiguration.__init__
     runtime_configuration.RuntimeConfiguration = dataclasses.dataclass(  # type: ignore[misc]
         runtime_configuration.RuntimeConfiguration, init=True, repr=False
     )
@@ -126,7 +129,7 @@ def pytest_configure(config):
     storage_configuration.LoadStorageConfiguration.load_volume_path = os.path.join(
         test_storage_root, "load"
     )
-    delattr(storage_configuration.LoadStorageConfiguration, "__init__")
+    del storage_configuration.LoadStorageConfiguration.__init__
     storage_configuration.LoadStorageConfiguration = dataclasses.dataclass(  # type: ignore[misc]
         storage_configuration.LoadStorageConfiguration, init=True, repr=False
     )
@@ -135,7 +138,7 @@ def pytest_configure(config):
         test_storage_root, "normalize"
     )
     # delete __init__, otherwise it will not be recreated by dataclass
-    delattr(storage_configuration.NormalizeStorageConfiguration, "__init__")
+    del storage_configuration.NormalizeStorageConfiguration.__init__
     storage_configuration.NormalizeStorageConfiguration = dataclasses.dataclass(  # type: ignore[misc]
         storage_configuration.NormalizeStorageConfiguration, init=True, repr=False
     )
@@ -143,7 +146,7 @@ def pytest_configure(config):
     storage_configuration.SchemaStorageConfiguration.schema_volume_path = os.path.join(
         test_storage_root, "schemas"
     )
-    delattr(storage_configuration.SchemaStorageConfiguration, "__init__")
+    del storage_configuration.SchemaStorageConfiguration.__init__
     storage_configuration.SchemaStorageConfiguration = dataclasses.dataclass(  # type: ignore[misc]
         storage_configuration.SchemaStorageConfiguration, init=True, repr=False
     )
@@ -216,6 +219,42 @@ def _reset_cli_global_state() -> None:
         return
     _cli_debug.disable_debug()
     _cli_echo.set_cli_host_name("dlt")
+
+
+def pytest_sessionfinish(session: "pytest.Session", exitstatus: int) -> None:
+    # A module-level skip (e.g. `skip_if_not_active`) raised while pytest imports a conftest/package
+    # `__init__` aborts collection of the whole tree (pytest-dev/pytest#7085) and exits with
+    # NO_TESTS_COLLECTED (5), which CI masks (`make ... || [ $? -eq 5 ]`) - so the run goes green
+    # having executed nothing.
+    if exitstatus != pytest.ExitCode.NO_TESTS_COLLECTED:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    skipped_reports = [report for report in reporter.stats.get("skipped", [])]
+    if any(not getattr(report, "nodeid", "") for report in skipped_reports):
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        reporter.write_line(
+            "ERROR: test collection was aborted by a module-level skip during conftest/package"
+            " import and produced zero tests. A test module with `skip_if_not_active` in"
+            " __init__.py and conftest.py must be present.",
+            red=True,
+        )
+
+
+@pytest.fixture(autouse=True)
+def preserve_context_timezone() -> Iterator[None]:
+    """Restores the context timezone and drops a `TimezoneContext` a test left in the container."""
+    container = Container()
+    had_context = TimezoneContext in container
+    previous = get_context_timezone()
+    try:
+        yield
+    finally:
+        # `del` runs the context's own restore, the explicit set below is what wins
+        if not had_context and TimezoneContext in container:
+            del container[TimezoneContext]
+        set_context_timezone(previous)
 
 
 # atexit.register(lambda: faulthandler.dump_traceback(file=sys.stderr, all_threads=True))

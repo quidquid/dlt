@@ -4,8 +4,11 @@ from pathlib import Path
 import pytest
 import tempfile
 
+from dlt._workspace.helpers.dashboard import strings
+
 from tests.workspace.helpers.dashboard.example_pipelines import (
     create_success_pipeline_duckdb,
+    create_success_pipeline_duckdb_casefold,
     create_success_pipeline_filesystem,
     create_extract_exception_pipeline,
     create_normalize_exception_pipeline,
@@ -17,6 +20,22 @@ from tests.workspace.helpers.dashboard.example_pipelines import (
     create_custom_dest_callable_pipeline,
     create_custom_dest_string_ref_pipeline,
 )
+
+
+def _visible_prefix(markdown_text: str) -> str:
+    """First plain-text run of a markdown landing string, before any markup.
+
+    marimo renders the landing strings as markdown (backticks become `<code>`,
+    links become `<a>`), so only this prefix appears verbatim in the rendered
+    output while staying tied to the source-of-truth copy in `strings.py`.
+    """
+    prefix = markdown_text.strip().split("`")[0].split(".")[0].strip()
+    assert prefix, f"no plain-text prefix in landing string: {markdown_text!r}"
+    return prefix
+
+
+NO_PIPELINES_TEXT = _visible_prefix(strings.home_no_pipelines)
+NO_TRACE_TEXT = _visible_prefix(strings.app_pipeline_no_trace)
 
 
 # resolver to resolve strings to pipelines
@@ -40,6 +59,18 @@ def success_pipeline_duckdb():
         db_conn = duckdb.connect()
         try:
             yield create_success_pipeline_duckdb(temp_dir, db_conn=db_conn)
+        finally:
+            db_conn.close()
+
+
+@pytest.fixture
+def success_pipeline_duckdb_casefold():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        import duckdb
+
+        db_conn = duckdb.connect()
+        try:
+            yield create_success_pipeline_duckdb_casefold(temp_dir, db_conn=db_conn)
         finally:
             db_conn.close()
 

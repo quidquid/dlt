@@ -18,7 +18,7 @@ from dlt.destinations.impl.redshift.configuration import (
     RedshiftCredentials,
     RedshiftClientConfiguration,
 )
-from dlt.destinations.impl.redshift.redshift import RedshiftClient, psycopg2
+from dlt.destinations.impl.redshift.redshift import RedshiftClient, RedshiftSqlClient, psycopg2
 
 from tests.common.utils import COMMON_TEST_CASES_PATH
 from tests.utils import get_test_storage_root, skipifpypy
@@ -53,6 +53,20 @@ def test_postgres_and_redshift_credentials_defaults() -> None:
     )
 
 
+def test_redshift_session_timezone(client: RedshiftClient) -> None:
+    """Redshift takes the timezone from the libpq startup options, like postgres."""
+    credentials = client.config.credentials.copy()
+    credentials.session_timezone = "Europe/Paris"
+    sql_client = RedshiftSqlClient(
+        client.sql_client.dataset_name,
+        client.sql_client.staging_dataset_name,
+        credentials,
+        client.capabilities,
+    )
+    with sql_client:
+        assert sql_client.execute_sql("SHOW timezone")[0][0] == "Europe/Paris"
+
+
 def test_redshift_factory() -> None:
     schema = Schema("schema")
     dest = redshift()
@@ -61,24 +75,32 @@ def test_redshift_factory() -> None:
     assert client.config.has_case_sensitive_identifiers is False
     assert client.capabilities.has_case_sensitive_identifiers is False
     assert client.capabilities.casefold_identifier is str.lower
+    assert client.config.additional_copy_options is None
 
     # set args explicitly
-    dest = redshift(has_case_sensitive_identifiers=True, staging_iam_role="LOADER")
+    dest = redshift(
+        has_case_sensitive_identifiers=True,
+        staging_iam_role="LOADER",
+        additional_copy_options=["FILLRECORD"],
+    )
     client = dest.client(schema, RedshiftClientConfiguration()._bind_dataset_name("dataset"))
     assert client.config.staging_iam_role == "LOADER"
     assert client.config.has_case_sensitive_identifiers is True
     assert client.capabilities.has_case_sensitive_identifiers is True
     assert client.capabilities.casefold_identifier is str
+    assert client.config.additional_copy_options == ["FILLRECORD"]
 
     # set args via config
     os.environ["DESTINATION__STAGING_IAM_ROLE"] = "LOADER"
     os.environ["DESTINATION__HAS_CASE_SENSITIVE_IDENTIFIERS"] = "True"
+    os.environ["DESTINATION__REDSHIFT__ADDITIONAL_COPY_OPTIONS"] = '["FILLRECORD"]'
     dest = redshift()
     client = dest.client(schema, RedshiftClientConfiguration()._bind_dataset_name("dataset"))
     assert client.config.staging_iam_role == "LOADER"
     assert client.config.has_case_sensitive_identifiers is True
     assert client.capabilities.has_case_sensitive_identifiers is True
     assert client.capabilities.casefold_identifier is str
+    assert client.config.additional_copy_options == ["FILLRECORD"]
 
 
 @skipifpypy

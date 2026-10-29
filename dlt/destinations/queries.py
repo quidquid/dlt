@@ -1,33 +1,6 @@
-from functools import partial
-from typing import Any, List
+from typing import List
 
 import sqlglot.expressions as sge
-from sqlglot.schema import Schema as SQLGlotSchema
-
-from dlt.common.destination.capabilities import TCasefoldIdentifier
-from dlt.common.libs.sqlglot import bind_query
-from dlt.destinations.sql_client import SqlClientBase
-
-
-def _normalize_query(
-    qualified_query: sge.Query,
-    sqlglot_schema: SQLGlotSchema,
-    *,
-    sql_client: SqlClientBase[Any],
-    casefold_identifier: TCasefoldIdentifier,
-) -> sge.Query:
-    """Backward compatibility wrapper for bind_query.
-
-    TODO: remove after next dlthub release
-    """
-    return bind_query(
-        qualified_query,
-        sqlglot_schema,
-        expand_table_name=partial(
-            sql_client.make_qualified_table_name_path, quote=False, casefold=False
-        ),
-        casefold_identifier=casefold_identifier,
-    )
 
 
 def build_row_counts_expr(

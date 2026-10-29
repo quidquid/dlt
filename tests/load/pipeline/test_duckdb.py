@@ -1,19 +1,18 @@
-from typing import ClassVar, Optional
-import pytest
 import os
 from datetime import datetime  # noqa: I251
+from typing import ClassVar, Optional
+
+import pytest
 
 import dlt
 from dlt.common import json
-from dlt.common.configuration.specs.aws_credentials import AwsCredentials
 from dlt.common.destination.configuration import ParquetFormatConfiguration
 from dlt.common.libs.pyarrow import columns_to_arrow
 from dlt.common.libs.pydantic import DltConfig
 from dlt.common.schema.exceptions import SchemaIdentifierNormalizationCollision
-from dlt.common.time import ensure_pendulum_datetime_utc, pendulum
-from dlt.common.utils import custom_environ
+from dlt.common.time import ensure_pendulum_datetime, pendulum
 
-from dlt.destinations import duckdb, filesystem
+from dlt.destinations import duckdb
 from dlt.pipeline.exceptions import PipelineStepFailed
 
 from tests.cases import TABLE_UPDATE_ALL_INT_PRECISIONS, TABLE_UPDATE_ALL_TIMESTAMP_PRECISIONS
@@ -21,8 +20,6 @@ from tests.load.duckdb.test_duckdb_table_builder import add_timezone_false_on_pr
 from tests.load.utils import (
     destinations_configs,
     DestinationTestConfiguration,
-    ALL_FILESYSTEM_DRIVERS,
-    AWS_BUCKET,
 )
 from tests.pipeline.utils import airtable_emojis, assert_table_counts, load_table_counts
 from tests.utils import data_to_item_format
@@ -88,9 +85,9 @@ def test_duck_precision_types(destination_config: DestinationTestConfiguration) 
     import pyarrow as pa
     import pandas as pd
 
-    now_s = ensure_pendulum_datetime_utc("2022-05-23T13:26:46+01:00")
-    now_ms = ensure_pendulum_datetime_utc("2022-05-23T13:26:46.167+01:00")
-    now_us = ensure_pendulum_datetime_utc("2022-05-23T13:26:46.167231+01:00")
+    now_s = ensure_pendulum_datetime("2022-05-23T13:26:46+01:00")
+    now_ms = ensure_pendulum_datetime("2022-05-23T13:26:46.167+01:00")
+    now_us = ensure_pendulum_datetime("2022-05-23T13:26:46.167231+01:00")
 
     # create pandas DataFrame with nanosecond precision timestamp
     df_ns = pd.DataFrame({"col4_ts": ["2022-05-23T13:26:46.167231345+01:00"]})
@@ -118,7 +115,7 @@ def test_duck_precision_types(destination_config: DestinationTestConfiguration) 
         columns_schema = add_timezone_false_on_precision(
             TABLE_UPDATE_ALL_TIMESTAMP_PRECISIONS + TABLE_UPDATE_ALL_INT_PRECISIONS
         )
-        arrow_schema = columns_to_arrow({c["name"]: c for c in columns_schema}, caps)
+        arrow_schema = columns_to_arrow({c["name"]: c for c in columns_schema}, caps, "UTC")
 
     def _verify_schema(arrow_schema_: pa.Schema, bit128type: pa.DataType) -> None:
         # also assert the intermediate arrow_schema produced from columns
@@ -171,10 +168,10 @@ def test_duck_precision_types(destination_config: DestinationTestConfiguration) 
     _verify_schema(table.schema, pa.decimal128(38, 0))
 
     table_row = table.to_pylist()[0]
-    table_row["col1_ts"] = ensure_pendulum_datetime_utc(table_row["col1_ts"])
-    table_row["col2_ts"] = ensure_pendulum_datetime_utc(table_row["col2_ts"])
-    table_row["col3_ts"] = ensure_pendulum_datetime_utc(table_row["col3_ts"])
-    table_row["col4_ts"] = ensure_pendulum_datetime_utc(table_row["col4_ts"])
+    table_row["col1_ts"] = ensure_pendulum_datetime(table_row["col1_ts"])
+    table_row["col2_ts"] = ensure_pendulum_datetime(table_row["col2_ts"])
+    table_row["col3_ts"] = ensure_pendulum_datetime(table_row["col3_ts"])
+    table_row["col4_ts"] = ensure_pendulum_datetime(table_row["col4_ts"])
     table_row.pop("col4_ts")
     row[0].pop("col4_ts")
     assert table_row == row[0]
@@ -367,63 +364,3 @@ def test_duckdb_destination_handover(destination_config: DestinationTestConfigur
 
     with p1.sql_client() as c:
         assert len(c.execute_sql("SELECT * FROM letters")) == 3
-
-
-@pytest.mark.parametrize(
-    "creds_mode",
-    ["default_chain", "explicit"],
-    ids=["default-chain", "explicit-creds"],
-)
-def test_duckdb_s3_credential_chain(creds_mode: str) -> None:
-    """DuckDB uses credential_chain provider when reading S3 via default AWS credentials."""
-    if "s3" not in ALL_FILESYSTEM_DRIVERS:
-        pytest.skip("s3 filesystem driver not configured")
-
-    fs_creds = dlt.secrets.get("destination.filesystem.credentials")  # type: ignore[var-annotated]
-    if not fs_creds or "aws_access_key_id" not in fs_creds:
-        pytest.skip("S3 filesystem credentials not configured")
-
-    import botocore.session
-
-    with custom_environ(
-        {
-            "AWS_ACCESS_KEY_ID": fs_creds["aws_access_key_id"],
-            "AWS_SECRET_ACCESS_KEY": fs_creds["aws_secret_access_key"],
-            "AWS_DEFAULT_REGION": fs_creds.get("region_name", "us-east-1"),
-        }
-    ):
-        if creds_mode == "default_chain":
-            creds = AwsCredentials.from_session(botocore.session.get_session())
-            assert creds.has_default_credentials()
-        else:
-            creds = AwsCredentials(
-                aws_access_key_id=fs_creds["aws_access_key_id"],
-                aws_secret_access_key=fs_creds["aws_secret_access_key"],
-                region_name=fs_creds.get("region_name", "us-east-1"),
-            )
-            assert not creds.has_default_credentials()
-
-        pipeline = dlt.pipeline(
-            f"test_duckdb_s3_{creds_mode}",
-            destination=filesystem(bucket_url=AWS_BUCKET, credentials=creds),
-            dev_mode=True,
-        )
-        pipeline.run(
-            [{"id": i, "value": f"row_{i}"} for i in range(5)],
-            table_name="items",
-        )
-
-        # read back via dataset() — this creates DuckDB views with S3 secrets
-        with pipeline.dataset() as ds:
-            rows = ds.items.fetchall()
-            assert len(rows) == 5
-
-        # verify the secret provider via sql_client
-        with pipeline.sql_client() as c:
-            secrets = c._conn.sql("SELECT name, type, provider FROM duckdb_secrets()").fetchall()
-            s3_secrets = [(n, t, p) for n, t, p in secrets if t == "s3"]
-            assert len(s3_secrets) > 0
-            if creds_mode == "default_chain":
-                assert all(p == "credential_chain" for _, _, p in s3_secrets)
-            else:
-                assert all(p == "config" for _, _, p in s3_secrets)

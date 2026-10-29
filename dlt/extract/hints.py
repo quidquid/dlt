@@ -1,4 +1,5 @@
 from typing import (
+    Iterator,
     Tuple,
     cast,
     Any,
@@ -7,7 +8,6 @@ from typing import (
     Sequence,
     Mapping,
     List,
-    NamedTuple,
 )
 from typing_extensions import Self
 
@@ -19,14 +19,15 @@ from dlt.common.schema.typing import (
     TPartialTableSchema,
     TTableSchema,
     TTableSchemaColumns,
+    TWriteDisposition,
     TWriteDispositionConfig,
-    TMergeDispositionDict,
-    TScd2StrategyDict,
     TAnySchemaColumns,
     TTableFormat,
     TSchemaContract,
     DEFAULT_VALIDITY_COLUMN_NAMES,
     MERGE_STRATEGIES,
+    MERGE_STRATEGY_OPTIONS,
+    MERGE_DISPOSITION_HINTS,
     TTableReferenceParam,
 )
 from dlt.common.exceptions import ValueErrorWithKnownValues
@@ -40,10 +41,16 @@ from dlt.common.schema.utils import (
     migrate_complex_types,
     new_column,
     new_table,
+    normalize_table_identifiers,
     remove_compound_props,
 )
+from dlt.common.destination.utils import (
+    MERGE_CONDITION_PLACEHOLDERS,
+    MERGE_CONDITION_VALUE_PLACEHOLDERS,
+    validate_merge_condition,
+)
 from dlt.common.typing import TAny, TDataItem, TColumnNames
-from dlt.common.time import ensure_pendulum_datetime_utc
+from dlt.common.time import ensure_datetime
 from dlt.common.utils import clone_dict_nested
 from dlt.common.normalizers.naming import NamingConvention
 from dlt.common.validation import validate_dict_ignoring_xkeys
@@ -230,6 +237,21 @@ class DltResourceHints:
         self.apply_hints(write_disposition=value)
 
     @property
+    def write_disposition_shorthand(self) -> Optional[TWriteDisposition]:
+        """Write disposition shorthand, `None` when the hint is dynamic (callable)."""
+        return DltResourceHints._write_disposition_shorthand(self.write_disposition)
+
+    @staticmethod
+    def _write_disposition_shorthand(
+        write_disposition: Optional[TTableHintTemplate[TWriteDispositionConfig]],
+    ) -> Optional[TWriteDisposition]:
+        if write_disposition is None or callable(write_disposition):
+            return None
+        if isinstance(write_disposition, dict):
+            return write_disposition["disposition"]
+        return write_disposition
+
+    @property
     def columns(self) -> TTableHintTemplate[TTableSchemaColumns]:
         """Gets columns' schema that can be modified in place"""
         return None if self._hints is None else self._hints.get("columns")  # type: ignore[return-value]
@@ -254,18 +276,24 @@ class DltResourceHints:
     def parent_table_name(self) -> Optional[TTableHintTemplate[str]]:
         return None if self._hints is None else self._hints.get("parent_table_name")
 
+    def _get_root_table_template(self, meta: Any = None) -> Tuple[TResourceHints, str, str]:
+        if isinstance(meta, TableNameMeta):
+            # look for variant
+            default_table_name = meta.table_name
+            root_table_template = self._hints_variants.get(meta.table_name, self._hints)
+            variant_name = meta.table_name if meta.table_name in self._hints_variants else None
+        else:
+            root_table_template = self._hints
+            variant_name = None
+            default_table_name = self.name
+        return root_table_template, variant_name, default_table_name
+
     def compute_table_schema(self, item: TDataItem = None, meta: Any = None) -> TTableSchema:
         """Computes the table schema based on hints and column definitions passed during resource creation.
         `item` parameter is used to resolve table hints based on data.
         `meta` parameter is taken from Pipe and may further specify table name if variant is to be used
         """
-        if isinstance(meta, TableNameMeta):
-            # look for variant
-            default_table_name = meta.table_name
-            root_table_template = self._hints_variants.get(default_table_name, self._hints)
-        else:
-            default_table_name = self.name
-            root_table_template = self._hints
+        root_table_template, variant_name, default_table_name = self._get_root_table_template(meta)
 
         if not root_table_template:
             return new_table(default_table_name, resource=self.name)
@@ -277,11 +305,11 @@ class DltResourceHints:
 
         # if table template present and has dynamic hints, the data item must be provided.
         if self._table_name_hint_fun and item is None:
-            raise DataItemRequiredForDynamicTableHints(self.name)
+            raise DataItemRequiredForDynamicTableHints(self.name, "name")
 
         # resolve
         resolved_template: TResourceHints = {
-            k: self._resolve_hint(item, v)
+            k: self._resolve_hint(k, item, v)
             for k, v in root_table_template.items()
             if k not in NATURAL_CALLABLES
         }  # type: ignore
@@ -294,6 +322,8 @@ class DltResourceHints:
         table_schema = self._hints_to_table_schema(resolved_template)
         if not is_nested_table(table_schema):
             table_schema["resource"] = self.name
+        if variant_name:
+            table_schema["variant_name"] = variant_name
         migrate_complex_types(table_schema, warn=True)
         validate_dict_ignoring_xkeys(
             spec=TTableSchema,
@@ -302,6 +332,81 @@ class DltResourceHints:
         )
 
         return table_schema
+
+    def get_nested_hints(
+        self,
+        root_table_name: str,
+        naming: NamingConvention,
+        item: TDataItem = None,
+        meta: Any = None,
+    ) -> Iterator[Tuple[str, str, TResourceNestedHints]]:
+        # allow for nested hints to be a part of a table variant
+        root_table_template, _, _ = self._get_root_table_template(meta)
+
+        # no nested hints if no table template
+        if root_table_template is None:
+            return
+
+        nested_hints = root_table_template.get("nested_hints")
+        if not nested_hints:
+            return
+        # resolve dynamic hint with actual data item
+        nested_hints = self._resolve_hint("nested_hints", item, nested_hints)
+
+        # make sure shorter paths go first
+        sorted_items = sorted(
+            nested_hints.items(), key=lambda item: len(item[0]) if isinstance(item[0], tuple) else 1
+        )
+        for sub_path, hints in sorted_items:
+            # both str and sequence is supported
+            full_path = list(
+                map(
+                    naming.normalize_table_identifier,
+                    (
+                        (root_table_name, sub_path)
+                        if isinstance(sub_path, str)
+                        else (root_table_name, *sub_path)
+                    ),
+                )
+            )
+            yield (
+                naming.shorten_fragments(*full_path),
+                naming.shorten_fragments(*full_path[:-1]),
+                hints,
+            )
+
+    def get_extra_placeholders(
+        self, root_table_name: str, naming: NamingConvention, meta: Any = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """Returns `extra_placeholders` and the `scd2` `boundary_timestamp` of the merge write
+        dispositions of the root table and its nested tables, by table name as in
+        `compute_nested_table_schemas`. Skips dynamic hints.
+        """
+        root_table_template, _, _ = self._get_root_table_template(meta)
+        if not root_table_template:
+            return {}
+        templates: List[Tuple[str, Any]] = [(root_table_name, root_table_template)]
+        # only static hints were validated when declared
+        if not callable(root_table_template.get("nested_hints")):
+            templates.extend(
+                (table_name, hints)
+                for table_name, _, hints in self.get_nested_hints(
+                    root_table_name, naming, meta=meta
+                )
+            )
+        extra_placeholders: Dict[str, Dict[str, Any]] = {}
+        for table_name, template in templates:
+            write_disposition = template.get("write_disposition")
+            if not isinstance(write_disposition, dict):
+                continue
+            placeholders = dict(write_disposition.get("extra_placeholders") or {})
+            if write_disposition.get("strategy") == "scd2" and (
+                boundary := write_disposition.get("boundary_timestamp")
+            ):
+                placeholders["boundary_timestamp"] = boundary
+            if placeholders:
+                extra_placeholders[table_name] = placeholders
+        return extra_placeholders
 
     def compute_nested_table_schemas(
         self,
@@ -313,37 +418,14 @@ class DltResourceHints:
         """Compute the table schema based on the current and all nested hints.
         Nested hints are resolved recursively.
         """
-        # allow for nested hints to be a part of a table variant
-        if isinstance(meta, TableNameMeta):
-            root_table_template = self._hints_variants.get(root_table_name, self._hints)
-        else:
-            root_table_template = self._hints
-        # no nested hints if no table template
-        if root_table_template is None:
-            return []
-
-        nested_hints = root_table_template.get("nested_hints")
-        if not nested_hints:
-            return []
-        # resolve dynamic hint with actual data item
-        nested_hints = self._resolve_hint(item, nested_hints)
-
         nested_table_schemas = []
-        # make sure shorter paths go first
-        sorted_items = sorted(
-            nested_hints.items(), key=lambda item: len(item[0]) if isinstance(item[0], tuple) else 1
-        )
-        for sub_path, hints in sorted_items:
-            # both str and sequence is supported
-            if isinstance(sub_path, str):
-                full_path: Tuple[str, ...] = (root_table_name, sub_path)
-            else:
-                full_path = (root_table_name, *sub_path)
-            table_name = naming.shorten_fragments(*full_path)
+        for table_name, parent_table, hints in self.get_nested_hints(
+            root_table_name, naming, item, meta
+        ):
             nested_table_template = self._clone_hints(hints)
 
             resolved_template: TResourceHints = {
-                k: self._resolve_hint(item, v)
+                k: self._resolve_hint(k, item, v)
                 for k, v in nested_table_template.items()
                 if k not in NATURAL_CALLABLES
             }  # type: ignore
@@ -357,14 +439,17 @@ class DltResourceHints:
             # in very rare cases parent may be explicitly defined for a nested table
             if "parent" not in nested_table_schema and may_be_nested(nested_table_schema):
                 # we add default parent linking if table is eligible
-                nested_table_schema["parent"] = naming.shorten_fragments(*full_path[:-1])
+                nested_table_schema["parent"] = parent_table
 
             if not is_nested_table(nested_table_schema):
                 nested_table_schema["resource"] = self.name
             elif nested_write_disposition := nested_table_schema.get("write_disposition"):
-                write_disposition = root_table_template.get("write_disposition")
-                # TODO: write_disposition may also be a callable, in that case generate warning as well
-                if nested_write_disposition != write_disposition:
+                root_table_template, _, _ = self._get_root_table_template(meta)
+                write_disposition = DltResourceHints._write_disposition_shorthand(
+                    root_table_template.get("write_disposition")
+                )
+                # dlt cannot compare a dynamic root disposition here
+                if write_disposition and nested_write_disposition != write_disposition:
                     logger.warning(
                         f"You defined '{nested_write_disposition}' write disposition on a nested"
                         f" table {table_name} while root table {root_table_name} has"
@@ -391,6 +476,23 @@ class DltResourceHints:
         #     nested_table_schemas.insert(0, placeholder_table_schema)
 
         return nested_table_schemas
+
+    def compute_tables(
+        self, naming: NamingConvention, item: TDataItem = None, meta: Any = None
+    ) -> List[TTableSchema]:
+        """Computes normalized root and nested table schemas for this resource.
+
+        Raises `DataItemRequiredForDynamicTableHints` when the table name is dynamic and `item` is
+        not provided.
+        """
+        root_table_schema = self.compute_table_schema(item, meta)
+        nested_tables_schema = self.compute_nested_table_schemas(
+            root_table_schema["name"], naming, item, meta
+        )
+        return [
+            normalize_table_identifiers(table_schema, naming)
+            for table_schema in (root_table_schema, *nested_tables_schema)
+        ]
 
     def apply_hints(
         self,
@@ -422,7 +524,7 @@ class DltResourceHints:
         Args:
             table_name (TTableHintTemplate[str]): name of the table which resource will generate
 
-            parent_table_parent (str, optional): A name of parent table if you want the resource to generate nested table. Please note that if you use merge, you must define `root_key` columns explicitly
+            parent_table_name (str, optional): A name of parent table if you want the resource to generate nested table. Please note that if you use merge, you must define `root_key` columns explicitly
 
             incremental (Incremental, optional): Enables the incremental loading for a resource.
 
@@ -559,6 +661,19 @@ class DltResourceHints:
     ) -> None:
         DltResourceHints.validate_dynamic_hints(hints_template)
         DltResourceHints.validate_write_disposition_hint(hints_template)
+        nested_hints = hints_template.get("nested_hints")
+        if isinstance(nested_hints, dict):
+            # nested tables use the placeholder values of the root table
+            root_wd = hints_template.get("write_disposition")
+            root_placeholders = (
+                list(cast(Dict[str, Any], root_wd).get("extra_placeholders") or {})
+                if isinstance(root_wd, dict)
+                else []
+            )
+            for nested_hint in nested_hints.values():
+                DltResourceHints.validate_write_disposition_hint(
+                    cast(TResourceHints, nested_hint), inherited_placeholders=root_placeholders
+                )
         DltResourceHints.validate_reference_hint(hints_template)
         if create_table_variant:
             # for table variants, table name must be a str
@@ -619,10 +734,15 @@ class DltResourceHints:
         # creates a deep copy of dict structure without actually copying the objects
         return clone_dict_nested(hints_template)
 
-    @staticmethod
-    def _resolve_hint(item: TDataItem, hint: TTableHintTemplate[TAny]) -> TAny:
+    def _resolve_hint(
+        self, hint_name: str, item: TDataItem, hint: TTableHintTemplate[TAny]
+    ) -> TAny:
         """Calls each dynamic hint passing a data item"""
-        return hint(item) if callable(hint) else hint  # type: ignore[no-any-return]
+        if callable(hint):
+            if item is None:
+                raise DataItemRequiredForDynamicTableHints(self.name, hint_name)
+            return hint(item)  # type: ignore[no-any-return]
+        return hint
 
     @staticmethod
     def _merge_key(hint: TColumnProp, keys: TColumnNames, partial: TPartialTableSchema) -> None:
@@ -663,17 +783,25 @@ class DltResourceHints:
     def _merge_merge_disposition_dict(dict_: Dict[str, Any]) -> None:
         """Merges merge disposition dict into x-hints in place."""
 
-        md_dict: TMergeDispositionDict = dict_.pop("write_disposition")
-        if merge_strategy := md_dict.get("strategy"):
-            dict_["x-merge-strategy"] = merge_strategy
-
-        if deduplicated := md_dict.get("deduplicated"):
-            dict_["x-stage-data-deduplicated"] = deduplicated
+        # the keys depend on the strategy, as `TWriteDispositionConfig` defines
+        md_dict: Dict[str, Any] = dict_.pop("write_disposition")
+        for key, hint in MERGE_DISPOSITION_HINTS.items():
+            if value := md_dict.get(key):
+                dict_[hint] = value
+        merge_strategy = md_dict.get("strategy")
+        # the merge compares the row version only if `skip_unchanged_rows` is `True`
+        row_version = md_dict.get("row_version_column_name")
+        if merge_strategy != "scd2" and row_version and md_dict.get("skip_unchanged_rows"):
+            # unlike scd2, upsert and cdc identify records by primary key and keep `_dlt_id`
+            dict_["columns"][row_version] = {
+                **dict_["columns"].get(row_version, {}),
+                "name": row_version,
+                "nullable": False,
+                "x-row-version": True,
+            }
 
         if merge_strategy == "scd2":
-            md_dict = cast(TScd2StrategyDict, md_dict)
-            if "boundary_timestamp" in md_dict:
-                dict_["x-boundary-timestamp"] = md_dict["boundary_timestamp"]
+            # the load package holds `boundary_timestamp`, so the schema does not change per load
             if md_dict.get("validity_column_names") is None:
                 from_, to = DEFAULT_VALIDITY_COLUMN_NAMES
             else:
@@ -762,30 +890,93 @@ class DltResourceHints:
             )
 
     @staticmethod
-    def validate_write_disposition_hint(template: TResourceHints) -> None:
+    def validate_write_disposition_hint(
+        template: TResourceHints, *, inherited_placeholders: Sequence[str] = ()
+    ) -> None:
+        """Validates the merge options of `template`. Merge conditions may also use
+        `inherited_placeholders`, ie. the root `extra_placeholders` in nested hints."""
         wd = template.get("write_disposition")
+        if (
+            isinstance(wd, dict)
+            and "exclude_resource_state" in wd
+            and wd["disposition"] != "replace"
+        ):
+            raise ValueError(
+                "dlt supports `exclude_resource_state` only with the `replace` write disposition."
+            )
         if isinstance(wd, dict) and wd["disposition"] == "merge":
-            wd = cast(TMergeDispositionDict, wd)
-            if "strategy" in wd and wd["strategy"] not in MERGE_STRATEGIES:
+            # the keys depend on the strategy, as `TWriteDispositionConfig` defines
+            md = cast(Dict[str, Any], wd)
+            strategy = md.get("strategy")
+            if "strategy" in md and strategy not in MERGE_STRATEGIES:
                 raise ValueErrorWithKnownValues(
-                    "write_disposition['strategy']", wd["strategy"], MERGE_STRATEGIES
+                    "write_disposition['strategy']", strategy, MERGE_STRATEGIES
                 )
 
-            if wd.get("strategy") == "scd2":
-                wd = cast(TScd2StrategyDict, wd)
+            extra_placeholders = md.get("extra_placeholders") or {}
+            if not isinstance(extra_placeholders, dict):
+                raise ValueError(
+                    "`write_disposition['extra_placeholders']` must be a dict of placeholder names"
+                    f" and values, not `{type(extra_placeholders).__name__}`."
+                )
+            reserved = (*MERGE_CONDITION_PLACEHOLDERS, *MERGE_CONDITION_VALUE_PLACEHOLDERS)
+            if clashing := sorted(set(extra_placeholders).intersection(reserved)):
+                raise ValueError(
+                    "`write_disposition['extra_placeholders']` redefines the placeholders"
+                    f" {', '.join('`' + name + '`' for name in clashing)}. dlt fills them. Rename"
+                    " these placeholders."
+                )
+            # merge conditions are the only consumers of `extra_placeholders`
+            if (
+                extra_placeholders
+                and strategy
+                and strategy not in MERGE_STRATEGY_OPTIONS["source_filter"]
+            ):
+                raise ValueError(
+                    "dlt supports `extra_placeholders` only with the `delete-insert`, `scd2`,"
+                    f" `upsert`, `cdc` merge strategies, not with `{strategy}`. Use one of these"
+                    " strategies or remove `extra_placeholders`."
+                )
+            placeholders = [*reserved, *extra_placeholders, *inherited_placeholders]
+            for hint_name in ("source_filter", "destination_scope"):
+                if filter_ := md.get(hint_name):
+                    validate_merge_condition(hint_name, cast(str, filter_), placeholders)
+            # the default strategy depends on the destination, which checks its options
+            if strategy:
+                for option, strategies in MERGE_STRATEGY_OPTIONS.items():
+                    if md.get(option) and strategy not in strategies:
+                        supported = ", ".join(f"`{s}`" for s in strategies)
+                        raise ValueError(
+                            f"dlt supports `{option}` only with the {supported} merge strategies,"
+                            f" not with `{strategy}`. Use one of these strategies or remove"
+                            f" `{option}`."
+                        )
+            # scd2 identifies records by the row version, the other strategies only compare it
+            if (
+                strategy != "scd2"
+                and md.get("row_version_column_name")
+                and not md.get("skip_unchanged_rows")
+            ):
+                logger.warning(
+                    f"dlt ignores `row_version_column_name` with the `{strategy or 'default'}`"
+                    " merge strategy, because `skip_unchanged_rows` is not `True`. To compare the"
+                    " row version, set `skip_unchanged_rows` to `True`."
+                )
+
+            if strategy == "scd2":
                 for ts in ("active_record_timestamp", "boundary_timestamp"):
                     if (
                         ts == "active_record_timestamp"
-                        and wd.get("active_record_timestamp") is None
+                        and md.get("active_record_timestamp") is None
                     ):
                         continue  # None is allowed for active_record_timestamp
-                    if ts in wd:
-                        if wd[ts] is None:
+                    if ts in md:
+                        if md[ts] is None:
                             continue
                         try:
-                            ensure_pendulum_datetime_utc(wd[ts])
+                            ensure_datetime(md[ts])
                         except Exception:
-                            raise ValueError(f"could not parse `{ts}` value `{wd[ts]}`")
+                            raise ValueError(f"could not parse `{ts}` value `{md[ts]}`")
 
     @staticmethod
     def validate_reference_hint(template: TResourceHints) -> None:

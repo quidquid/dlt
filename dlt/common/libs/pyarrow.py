@@ -2,6 +2,7 @@ import base64
 import gzip
 import uuid
 from datetime import time  # noqa: I251
+from functools import lru_cache
 from typing import (
     Any,
     Dict,
@@ -25,7 +26,7 @@ from dlt.common.json import json, custom_encode, map_nested_values_in_place
 from dlt.common.destination.capabilities import DestinationCapabilitiesContext
 from dlt.common.schema.typing import TColumnType
 from dlt.common.schema.utils import is_nullable_column, dlt_load_id_column
-from dlt.common.time import get_precision_from_datetime_unit
+from dlt.common.time import UTC_NAME, get_context_timezone_name, get_precision_from_datetime_unit
 from dlt.common.typing import AnyType, StrStr, TFileOrPath, TDataItems
 from dlt.common.normalizers.naming import NamingConvention
 
@@ -107,6 +108,18 @@ class UnsupportedArrowTypeException(DltException):
     def table_name(self, value: str) -> None:
         self._table_name = value
         self._update_message()
+
+
+class InvalidTimezoneException(DltException):
+    """Exception raised when arrow cannot resolve a timezone name."""
+
+    def __init__(self, tz: str, arrow_message: str) -> None:
+        self.tz = tz
+        super().__init__(
+            f"dlt cannot resolve timezone `{tz}`: {arrow_message}. Use a canonical IANA name, for"
+            " example `Europe/Berlin`. On Windows install `tzdata`, arrow ships no timezone"
+            " database: https://arrow.apache.org/docs/cpp/build_system.html#runtime-dependencies"
+        )
 
 
 class PyToArrowConversionException(DltException):
@@ -204,6 +217,21 @@ class ArrowSchemaNormalizationResult(NamedTuple):
     columns: TTableSchemaColumns
 
 
+def get_column_timezone(
+    column: TColumnType, tz: str, caps: DestinationCapabilitiesContext = None
+) -> Optional[str]:
+    """Timezone a timestamp column is stored in, `None` when the column is stored naive."""
+    store_aware = column.get("timezone", True)
+    if caps is not None:
+        # a destination without tz support holds the context wall clock, like a `timezone=False`
+        # column; one without naive support holds the instant, like a `timezone=True` column
+        if not caps.supports_tz_aware_datetime:
+            store_aware = False
+        elif not caps.supports_naive_datetime:
+            store_aware = True
+    return tz if store_aware else None
+
+
 def get_py_arrow_datatype(
     column: TColumnType,
     caps: DestinationCapabilitiesContext,
@@ -217,8 +245,7 @@ def get_py_arrow_datatype(
     elif column_type == "bool":
         return pyarrow.bool_()
     elif column_type == "timestamp":
-        # sets timezone to None when timezone hint is false
-        timezone = tz if column.get("timezone", True) else None
+        timezone = get_column_timezone(column, tz, caps)
         precision = column.get("precision")
         if precision is None:
             precision = caps.timestamp_precision
@@ -388,9 +415,9 @@ def get_nested_column_type_from_py_arrow(dtype: pyarrow.DataType) -> TColumnType
 def serialize_type(dtype: pyarrow.DataType) -> str:
     """Serializes arrow type via arrow ipc as base64 str"""
     schema = pyarrow.schema([pyarrow.field("c", dtype)])
-    return "arrow-ipc:" + base64.b64encode(gzip.compress(schema.serialize().to_pybytes())).decode(
-        "ascii"
-    )
+    # mtime=0 keeps gzip deterministic
+    compressed = gzip.compress(schema.serialize().to_pybytes(), mtime=0)
+    return "arrow-ipc:" + base64.b64encode(compressed).decode("ascii")
 
 
 def deserialize_type(type_str: str) -> pyarrow.DataType:
@@ -498,6 +525,8 @@ def should_normalize_arrow_schema(
     schema: pyarrow.Schema,
     columns: TTableSchemaColumns,
     naming: NamingConvention,
+    caps: DestinationCapabilitiesContext = None,
+    tz: str = None,
 ) -> ArrowSchemaNormalizationResult:
     """Figure out if any of the normalization steps must be executed. This prevents
     from rewriting arrow tables when no changes are needed. Refer to `normalize_py_arrow_item`
@@ -520,7 +549,7 @@ def should_normalize_arrow_schema(
             nullable_updates[norm_name] = nullable_mapping[norm_name]
         # Detect arrow columns that require to be normalized
         if norm_name in columns and should_normalize_py_arrow_item_column(
-            columns[norm_name], field.type
+            columns[norm_name], field.type, tz, caps
         ):
             column_cast[norm_name] = True
 
@@ -557,6 +586,7 @@ def normalize_py_arrow_item(
     columns: TTableSchemaColumns,
     naming: NamingConvention,
     caps: DestinationCapabilitiesContext,
+    tz: str = None,
 ) -> TAnyArrowItem:
     """Normalize arrow `item` schema according to the `columns`. Note that
     columns must be already normalized.
@@ -570,10 +600,11 @@ def normalize_py_arrow_item(
 
     NOTE: nullability is not enforced. it is up to destination to do that.
     """
+    tz = tz or get_context_timezone_name()
     item = remove_null_columns(item)
     schema = item.schema
     should_normalize, rename_mapping, rev_mapping, nullable_updates, columns = (
-        should_normalize_arrow_schema(schema, columns, naming)
+        should_normalize_arrow_schema(schema, columns, naming, caps, tz)
     )
     if not should_normalize:
         return item
@@ -593,7 +624,7 @@ def normalize_py_arrow_item(
 
             # coerce type
             new_type, new_arrow_column = normalize_py_arrow_item_column(
-                column, new_field.type, item.column(idx)
+                column, new_field.type, item.column(idx), tz, caps
             )
 
             # use renamed field
@@ -603,7 +634,7 @@ def normalize_py_arrow_item(
             # column does not exist in pyarrow. create empty field and column
             new_field = pyarrow.field(
                 column_name,
-                get_py_arrow_datatype(column, caps, "UTC"),
+                get_py_arrow_datatype(column, caps, tz),
                 nullable=is_nullable_column(column),
             )
             new_fields.append(new_field)
@@ -622,22 +653,45 @@ def normalize_py_arrow_item(
     )
 
 
+def assume_arrow_timezone(arrow_column: pyarrow.Array, tz: str) -> pyarrow.Array:
+    """Labels a naive timestamp column with `tz` without shifting the values."""
+    try:
+        return pyarrow.compute.assume_timezone(
+            arrow_column, tz, ambiguous="latest", nonexistent="latest"
+        )
+    except pyarrow.ArrowInvalid as inv_ex:
+        if "timezone database" in str(inv_ex):
+            raise InvalidTimezoneException(tz, str(inv_ex)) from inv_ex
+        raise
+
+
+@lru_cache(maxsize=None)
+def validate_arrow_timezone(tz: str) -> None:
+    """Checks that arrow can resolve `tz`, which `pyarrow.timestamp` never does."""
+    assume_arrow_timezone(pyarrow.array([0], type=pyarrow.timestamp("s")), tz)
+
+
 def should_normalize_py_arrow_item_column(
-    column: TColumnSchema, arrow_type: pyarrow.DataType
+    column: TColumnSchema,
+    arrow_type: pyarrow.DataType,
+    tz: str = None,
+    caps: DestinationCapabilitiesContext = None,
 ) -> bool:
     # Only handle timestamp columns
     if not pyarrow.types.is_timestamp(arrow_type):
         return False
-
-    current_tz = arrow_type.tz
-    target_tz = "UTC" if column.get("timezone", True) else None
+    tz = tz or get_context_timezone_name()
 
     # normalize if tz different
-    return current_tz != target_tz  # type: ignore[no-any-return]
+    return arrow_type.tz != get_column_timezone(column, tz, caps)  # type: ignore[no-any-return]
 
 
 def normalize_py_arrow_item_column(
-    column: TColumnSchema, arrow_type: pyarrow.Field, arrow_column: pyarrow.Array
+    column: TColumnSchema,
+    arrow_type: pyarrow.Field,
+    arrow_column: pyarrow.Array,
+    tz: str = None,
+    caps: DestinationCapabilitiesContext = None,
 ) -> Tuple[pyarrow.DataType, pyarrow.Array]:
     """Normalize arrow timestamp column timezone according to dlt schema column convention.
 
@@ -645,35 +699,36 @@ def normalize_py_arrow_item_column(
         column: dlt column schema with timezone hint
         arrow_type: actual PyArrow data type
         arrow_column: actual PyArrow column data
+        tz: timezone tz-aware columns are labelled with
+        caps: destination capabilities, a destination without tz support gets naive columns
 
     Returns:
         Tuple of (modified_type, modified_column) or (arrow_field, arrow_column) if no changes needed
     """
-    if not should_normalize_py_arrow_item_column(column, arrow_type):
+    tz = tz or get_context_timezone_name()
+    if not should_normalize_py_arrow_item_column(column, arrow_type, tz, caps):
         return arrow_type, arrow_column
 
     unit = arrow_type.unit
     current_tz = arrow_type.tz
-    target_tz = "UTC" if column.get("timezone", True) else None
+    target_tz = get_column_timezone(column, tz, caps)
 
-    if target_tz == "UTC":
-        # Need tz-aware UTC
+    if target_tz is not None:
+        # `cast` takes any string, so the name must be checked before it reaches a schema
+        validate_arrow_timezone(target_tz)
         if current_tz is None:
-            # Attach UTC without shifting (values already represent UTC)
-            col = pyarrow.compute.assume_timezone(
-                arrow_column, "UTC", ambiguous="latest", nonexistent="latest"
-            )
-        else:
-            # Metadata-only cast to UTC tz
-            col = pyarrow.compute.cast(arrow_column, pyarrow.timestamp(unit, "UTC"))
+            # a naive value is read in the target zone, as it is on the object path
+            arrow_column = assume_arrow_timezone(arrow_column, target_tz)
+        # metadata-only cast, the instant is preserved
+        col = pyarrow.compute.cast(arrow_column, pyarrow.timestamp(unit, target_tz))
     else:
         # Need naive
         if current_tz is None:
             col = arrow_column  # already naive
         else:
-            # Make naive wall-clock; if you want naive-in-UTC, ensure tz metadata is UTC first
-            if current_tz != "UTC":
-                arrow_column = pyarrow.compute.cast(arrow_column, pyarrow.timestamp(unit, "UTC"))
+            # the wall clock is taken in `tz`, as it is on the object path
+            if current_tz != tz:
+                arrow_column = pyarrow.compute.cast(arrow_column, pyarrow.timestamp(unit, tz))
             col = pyarrow.compute.local_timestamp(arrow_column)
 
     return pyarrow.timestamp(unit, target_tz), col
@@ -694,7 +749,7 @@ def add_dlt_load_id_column(
     idx = item.schema.get_field_index(dlt_load_id_col_name)
     # if the column already exists, get rid of it
     if idx != -1:
-        item = remove_columns(item, dlt_load_id_col_name)
+        item = remove_columns(item, [dlt_load_id_col_name])
 
     # get pyarrow.string() type
     pyarrow_string = get_py_arrow_datatype(
@@ -751,7 +806,7 @@ def get_normalized_arrow_fields_mapping(schema: pyarrow.Schema, naming: NamingCo
 def dlt_column_to_arrow_field(
     column: TColumnSchema,
     caps: DestinationCapabilitiesContext,
-    timestamp_timezone: str = "UTC",
+    timestamp_timezone: str,
 ) -> pyarrow.Field:
     """Convert a single dlt column schema to a PyArrow field.
 
@@ -773,7 +828,7 @@ def dlt_column_to_arrow_field(
 def columns_to_arrow(
     columns: TTableSchemaColumns,
     caps: DestinationCapabilitiesContext,
-    timestamp_timezone: str = "UTC",
+    timestamp_timezone: str,
 ) -> pyarrow.Schema:
     """Convert a table schema columns dict to a pyarrow schema.
 
@@ -791,6 +846,18 @@ def columns_to_arrow(
             for column in columns.values()
             if column.get("data_type") is not None
         ]
+    )
+
+
+def get_local_dataset_reader(file_paths: Sequence[str]) -> pyarrow.RecordBatchReader:
+    """Streams local data files with bounded readahead to limit memory use over throughput."""
+    # NOTE: import inline, pyarrow.dataset pulls heavy dependencies
+    import pyarrow.dataset
+
+    return (
+        pyarrow.dataset.dataset(file_paths)
+        .scanner(batch_size=65536, batch_readahead=2, fragment_readahead=1)
+        .to_reader()
     )
 
 
@@ -929,57 +996,97 @@ def concat_batches_and_tables_in_order(
 ) -> pyarrow.Table:
     """Concatenate iterable of tables and batches into a single table, preserving row order.
 
+    Each record batch is converted to a table individually - they are never grouped via
+    `Table.from_batches` (which rejects differing nullability/schemas that `concat_tables` can
+    otherwise reconcile). All reconciliation happens in `concat_tables` per `promote_options`.
+
     Args:
         promote_options: PyArrow concat_tables promote_options. "none" (default) requires identical
-            schemas and enables zero-copy concat. "default" promotes within type families (e.g.
-            int32→int64). "permissive" promotes across families (e.g. int64→double).
+            schemas and enables zero-copy concat. "default" reconciles nullability and fills missing
+            columns. "permissive" additionally promotes across type families (e.g. int64→double).
     """
-    batches = []
     tables = []
     for item in tables_or_batches:
-        if isinstance(item, pyarrow.RecordBatch):
-            batches.append(item)
-        elif isinstance(item, pyarrow.Table):
-            if batches:
-                tables.append(pyarrow.Table.from_batches(batches))
-                batches = []
+        if isinstance(item, pyarrow.Table):
             tables.append(item)
+        elif isinstance(item, pyarrow.RecordBatch):
+            tables.append(pyarrow.Table.from_batches([item]))
         else:
             raise ValueError(f"Unsupported type: `{type(item)}`")
-    if batches:
-        tables.append(pyarrow.Table.from_batches(batches))
-    # "none" ensures 0 copy concat; "default"/"permissive" allow type promotion
+    # "none" ensures 0 copy concat; "default"/"permissive" reconcile/promote
     return pyarrow.concat_tables(tables, promote_options=promote_options)
+
+
+# errors raised when arrow schemas cannot be merged/promoted (ArrowTypeError is not an ArrowInvalid)
+ARROW_SCHEMA_MERGE_ERRORS = (
+    pyarrow.lib.ArrowInvalid,
+    pyarrow.lib.ArrowTypeError,
+    pyarrow.lib.ArrowNotImplementedError,
+)
+
+
+def reconcile_schema_and_cast(
+    target_schema: pyarrow.Schema, table: pyarrow.Table, promote_options: str
+) -> Optional[pyarrow.Table]:
+    """Computes the unified schema of `target_schema` and `table` under `promote_options`. If a
+    unified schema exists, casts `table` to `target_schema` (the first/locked schema) and returns
+    it - the cast is unsafe for "permissive" and may lose data. Returns None when no unified schema
+    exists, so the caller rotates to a new file. Column sets and order are assumed aligned."""
+    safe_cast = promote_options != "permissive"
+    try:
+        # only validates compatibility (raises e.g. on timestamp vs int64, which a bare cast would
+        # silently reinterpret); the unified type itself is not used - we always cast to the target
+        pyarrow.unify_schemas(
+            [target_schema.remove_metadata(), table.schema.remove_metadata()],
+            promote_options=promote_options,
+        )
+        return table.cast(target_schema, safe=safe_cast)
+    except ARROW_SCHEMA_MERGE_ERRORS:
+        return None
+
+
+def concat_and_group_in_compatible_schemas(
+    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]],
+    promote_options: str,
+) -> List[pyarrow.Table]:
+    """Groups items into tables. "permissive" locks group schema at
+    its first item and unsafe-casts later items into it (accepting data loss) or starts a new table -
+    "default" merges runs with safe symmetric concat."""
+    tables: List[pyarrow.Table] = []
+    current: Optional[pyarrow.Table] = None
+    for item in tables_or_batches:
+        table = pyarrow.table(item)
+        if current is None:
+            current = table
+            continue
+        if promote_options == "permissive":
+            fitted = reconcile_schema_and_cast(current.schema, table, promote_options)
+            merged = (
+                None if fitted is None else concat_batches_and_tables_in_order([current, fitted])
+            )
+        else:
+            try:
+                merged = concat_batches_and_tables_in_order([current, table], promote_options)
+            except ARROW_SCHEMA_MERGE_ERRORS:
+                merged = None
+        if merged is None:
+            tables.append(current)
+            current = table
+        else:
+            current = merged
+    if current is not None:
+        tables.append(current)
+    return tables
 
 
 def transpose_rows_to_columns(
     rows: TDataItems, column_names: Iterable[str]
-) -> dict[str, Any]:  # dict[str, np.ndarray]
-    """Transpose rows (data items) into columns (numpy arrays). Returns a dictionary of {column_name: column_data}
-
-    Uses pandas if available. Otherwise, use numpy, which is slower
-    """
-    try:
-        from dlt.common.libs.numpy import numpy as np
-    except MissingDependencyException:
-        raise MissingDependencyException(
-            "dlt pyarrow helpers", ["numpy"], "Numpy is required for this pyarrow operation"
-        )
-
-    try:
-        from pandas._libs import lib
-
-        # NOTE: this is part of public interface now via DataFrame.from_records()
-        pivoted_rows = lib.to_object_array_tuples(rows).T
-    except ImportError:
-        logger.info(
-            "Pandas not installed, reverting to numpy.asarray to create a table which is slower"
-        )
-        pivoted_rows = np.asarray(rows, dtype="object", order="K").T
-    return {
-        column_name: data.ravel()
-        for column_name, data in zip(column_names, np.vsplit(pivoted_rows, len(pivoted_rows)))
-    }
+) -> dict[str, Any]:  # dict[str, Sequence[Any]]
+    """Transpose rows (data items) into columns. Returns a dictionary of {column_name: column_data}"""
+    if not rows:
+        return {column_name: () for column_name in column_names}
+    # plain zip benchmarked faster than numpy/pandas object-array pivoting
+    return dict(zip(column_names, zip(*rows)))
 
 
 def uuid_to_string(arr: Any) -> Any:  # pyarrow.Array -> pyarrow.Array
@@ -1039,22 +1146,48 @@ def uuid_to_string(arr: Any) -> Any:  # pyarrow.Array -> pyarrow.Array
     return fsb36.cast(pa.string())
 
 
-def convert_numpy_to_arrow(
-    column_data: Any,  # 1-dimensional np.ndarray
+def _first_non_none_value(column_data: Any) -> Any:
+    for value in column_data:
+        if value is not None:
+            return value
+    return None
+
+
+def _datetimes_to_arrow(
+    column_data: Any,
+    column_schema: TColumnSchema,
+    arrow_type: Any,
+    tz: str,
+    caps: DestinationCapabilitiesContext = None,
+) -> Any:  # pyarrow.Array
+    """Converts datetimes to a timestamp array, reading naive values in `tz`, not in UTC."""
+    # pyarrow reads a naive datetime as if it were UTC, so the array is built in the zone the
+    # values carry and the timezone hint is applied after, exactly as on the object path
+    aware = getattr(_first_non_none_value(column_data), "tzinfo", None) is not None
+    source_type = pyarrow.timestamp(arrow_type.unit, UTC_NAME if aware else None)
+    return normalize_py_arrow_item_column(
+        column_schema, source_type, pyarrow.array(column_data, type=source_type), tz, caps
+    )[1]
+
+
+def convert_array_to_arrow(
+    column_data: Any,  # 1-dimensional sequence of column values
     caps: DestinationCapabilitiesContext,
     column_schema: TColumnSchema,
     tz: str,
     safe_arrow_conversion: bool,
+    arrow_type: Optional[Any] = None,
 ) -> Any:  # pyarrow.Array
-    """Convert a numpy array to a pyarrow array.
+    """Convert a sequence of column values to a pyarrow array.
 
     Args:
-        rows: data items
+        column_data: column values
         caps: capabilities of the storage backend
-        columns: dlt hints about the table columns (e.g., data type, nullabe)
+        column_schema: dlt hints about the column (e.g., data type, nullable)
         tz: time zone identifier
         safe_arrow_conversion: if False, truncation and loss of precision is allowed
             ref: https://arrow.apache.org/docs/python/generated/pyarrow.compute.CastOptions.html#pyarrow.compute.CastOptions
+        arrow_type: precomputed target arrow type, derived from `column_schema` when None
 
     Returns:
         an arrow Array
@@ -1063,14 +1196,25 @@ def convert_numpy_to_arrow(
 
     dlt_data_type = column_schema.get("data_type")
     inferred_arrow_type = (
-        get_py_arrow_datatype(column_schema, caps, tz) if dlt_data_type is not None else None
+        arrow_type
+        if arrow_type is not None
+        else (get_py_arrow_datatype(column_schema, caps, tz) if dlt_data_type is not None else None)
     )
     inferred_array = None
 
     # base case (0): allow pyarrow to infer type, or create array of dlt specified type
     try:
-        # type=None lets pyarrow infer the type from the data
-        inferred_array = pa.array(column_data, type=inferred_arrow_type)
+        if (
+            tz != UTC_NAME
+            and inferred_arrow_type is not None
+            and pa.types.is_timestamp(inferred_arrow_type)
+        ):
+            inferred_array = _datetimes_to_arrow(
+                column_data, column_schema, inferred_arrow_type, tz, caps
+            )
+        else:
+            # type=None lets pyarrow infer the type from the data
+            inferred_array = pa.array(column_data, type=inferred_arrow_type)
         # pyarrow >=24 infers UUIDs as the `arrow.uuid` extension; coerce to string
         # so destinations see canonical hyphenated text, matching pyarrow <24 behavior
         if inferred_array is not None and _is_arrow_uuid_extension(inferred_array.type):
@@ -1083,13 +1227,8 @@ def convert_numpy_to_arrow(
         )
 
     def _first_non_none(types_: Sequence[AnyType]) -> bool:
-        # determine the first non-null value to guide fallbacks
-        first_non_none = None
-        for _v in column_data:
-            if _v is not None:
-                first_non_none = _v
-                break
-        return isinstance(first_non_none, types_)  # type: ignore[arg-type]
+        # the first non-null value guides the fallbacks
+        return isinstance(_first_non_none_value(column_data), types_)  # type: ignore[arg-type]
 
     # case 1 & 2: pyarrow infers the type (e.g., float, string) THEN cast it to the dlt specified type; less constraints than the base case
     # for example, this handles when backends return decimals as floats or strings
@@ -1207,7 +1346,24 @@ def cast_arrow_array_as_column_schema(
     )
     inferred_array = None
     try:
-        inferred_array = raw_array.cast(inferred_arrow_type, safe=safe_arrow_conversion)
+        if (
+            tz != UTC_NAME
+            and inferred_arrow_type is not None
+            and pa.types.is_timestamp(inferred_arrow_type)
+            and pa.types.is_timestamp(raw_array.type)
+        ):
+            # casting straight to the target reads a naive value as UTC, so only the unit is cast
+            # here and the timezone hint is applied after
+            unit_type = pyarrow.timestamp(inferred_arrow_type.unit, raw_array.type.tz)
+            _, inferred_array = normalize_py_arrow_item_column(
+                column_schema,
+                unit_type,
+                raw_array.cast(unit_type, safe=safe_arrow_conversion),
+                tz,
+                caps,
+            )
+        else:
+            inferred_array = raw_array.cast(inferred_arrow_type, safe=safe_arrow_conversion)
     except (pa.ArrowInvalid, pyarrow.ArrowTypeError, pyarrow.ArrowNotImplementedError) as e:
         # TODO add specific error handling as we encounter them
         error_msg = e.args[0]
@@ -1244,7 +1400,7 @@ def cast_arrow_array_as_column_schema(
             # cast strings to date-times
             raw_array = raw_array.cast(actual_type)
             _, inferred_array = normalize_py_arrow_item_column(
-                column_schema, actual_type, raw_array
+                column_schema, actual_type, raw_array, tz, caps
             )
         elif dlt_data_type == "time" and "function cast_time" in error_msg:
             if "from string to" in error_msg:
@@ -1257,7 +1413,7 @@ def cast_arrow_array_as_column_schema(
                 data = memoryview(data_b).cast("q")
 
                 def allocate_lazy_null_mask() -> None:
-                    nonlocal is_null, data, is_null_b
+                    nonlocal is_null, is_null_b
                     if is_null is None:
                         nbytes = (n + 7) // 8
                         is_null_b = pa.allocate_buffer(nbytes, resizable=False)
@@ -1402,6 +1558,74 @@ def cast_arrow_as_columns_schema(
     return item.__class__.from_arrays(arrays_out, schema=new_schema)
 
 
+def _struct_timestamp_types(
+    rows: TDataItems, arrow_types: Dict[str, Optional[Any]]
+) -> Dict[str, Optional[Any]]:
+    """Struct field types holding the zone the values carry, which pyarrow reads as UTC otherwise."""
+    by_name = isinstance(rows[0], dict)
+    struct_types = dict(arrow_types)
+    for index, (name, arrow_type) in enumerate(arrow_types.items()):
+        if not pyarrow.types.is_timestamp(arrow_type):
+            continue
+        # a dict row may omit the key and a tuple row may be short, both meaning no value
+        values = (
+            (row.get(name) for row in rows)
+            if by_name
+            else (row[index] if index < len(row) else None for row in rows)
+        )
+        aware = getattr(_first_non_none_value(values), "tzinfo", None) is not None
+        struct_types[name] = pyarrow.timestamp(arrow_type.unit, UTC_NAME if aware else None)
+    return struct_types
+
+
+def _row_tuples_to_arrow_struct(
+    rows: TDataItems,
+    columns: TTableSchemaColumns,
+    arrow_types: Dict[str, Optional[Any]],
+    tz: str,
+    caps: DestinationCapabilitiesContext = None,
+) -> Optional[Any]:  # Optional[pyarrow.Table]
+    """Converts row tuples to an arrow table in a single pass via a `StructArray`."""
+    from dlt.common.libs.pyarrow import pyarrow as pa
+
+    # json values typically need serialization fallbacks which fail the whole struct
+    if any(
+        arrow_types[name] is None or column.get("data_type") == "json"
+        for name, column in columns.items()
+    ):
+        return None
+
+    # the struct labels timestamps with the target zone, which shifts a naive value. they are
+    # built in the zone the values carry and the timezone hint is applied after the flatten
+    normalize_timestamps = tz != UTC_NAME and bool(rows)
+    try:
+        struct_types = (
+            _struct_timestamp_types(rows, arrow_types) if normalize_timestamps else arrow_types
+        )
+        struct_fields = [pa.field(name, struct_types[name]) for name in columns]
+        arrays = pa.array(rows, type=pa.struct(struct_fields)).flatten()
+    except Exception as e:
+        logger.debug(
+            "Single-pass arrow conversion not possible, using per-column fallbacks:"
+            f" {type(e).__name__}: {e}"
+        )
+        return None
+    if normalize_timestamps:
+        arrays = [
+            (
+                normalize_py_arrow_item_column(columns[field.name], field.type, array, tz, caps)[1]
+                if pa.types.is_timestamp(field.type)
+                else array
+            )
+            for field, array in zip(struct_fields, arrays)
+        ]
+    schema = pa.schema(
+        pa.field(name, arrow_types[name], nullable=columns[name].get("nullable", True))
+        for name in columns
+    )
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
 def row_tuples_to_arrow(
     rows: TDataItems,
     caps: DestinationCapabilitiesContext,
@@ -1428,16 +1652,37 @@ def row_tuples_to_arrow(
     """
     from dlt.common.libs.pyarrow import pyarrow as pa
 
-    columnar = transpose_rows_to_columns(rows, column_names=columns.keys())
+    # pyarrow struct conversion accepts only tuples and dicts, and tuple iteration is
+    # ~3x faster than driver row objects (e.g. sqlalchemy Row) in the transpose below
+    if rows and not isinstance(rows[0], (tuple, dict)):
+        rows = [tuple(row) for row in rows]
+
+    # compute target arrow types once; None when the type must be inferred from data
+    arrow_types: Dict[str, Optional[Any]] = {
+        name: get_py_arrow_datatype(column, caps, tz) if column.get("data_type") else None
+        for name, column in columns.items()
+    }
+
+    if (
+        arrow_table := _row_tuples_to_arrow_struct(rows, columns, arrow_types, tz, caps)
+    ) is not None:
+        return arrow_table
+
+    transposed_rows = transpose_rows_to_columns(rows, column_names=columns.keys())
 
     arrow_arrays = []
     arrow_fields = []
-    for column_name, column_data in columnar.items():
+    for column_name, column_data in transposed_rows.items():
         column_schema = columns[column_name]
 
         try:
-            arrow_array = convert_numpy_to_arrow(
-                column_data, caps, column_schema, tz, safe_arrow_conversion
+            arrow_array = convert_array_to_arrow(
+                column_data,
+                caps,
+                column_schema,
+                tz,
+                safe_arrow_conversion,
+                arrow_types[column_name],
             )
         # TODO if converting to arrow fail, should we raise or skip column?
         except PyToArrowConversionException as e:
@@ -1511,35 +1756,48 @@ def set_plus0000_timezone_to_utc(tbl: pyarrow.Table) -> pyarrow.Table:
     return pyarrow.Table.from_arrays(arrays, schema=new_schema)
 
 
-def cast_date64_columns_to_timestamp(tbl: pyarrow.Table, tz: Optional[str] = None) -> pyarrow.Table:
+def cast_connectorx_temporal_columns(tbl: pyarrow.Table, tz: Optional[str] = None) -> pyarrow.Table:
     """
-    Cast any date64 columns to timestamp with microsecond precision, preserving the
-    semantic time values. Uses pyarrow.compute.cast on the column (works for chunked arrays)
-    to cast from milliseconds (date64) to microseconds (timestamp[us]).
+    Normalize connectorx temporal columns to microsecond precision.
+
+    connectorx returns timestamps as date64 (milliseconds) on older versions and as
+    timestamp[ns] on newer ones (the `arrow_stream` return type), and times as time64[ns].
+    dlt and its destinations use microseconds and no database connectorx reads from has
+    sub-microsecond resolution, so casting to `us` is lossless. date64 is rescaled to
+    timestamp[us]; nanosecond timestamp and time64 columns are truncated to `us` with the
+    timezone preserved; other units (ms, s, us) and unrelated columns are left untouched.
 
     Args:
         tbl: Input Arrow table.
-        tz: Optional timezone to annotate the resulting timestamp with (e.g. "UTC").
-            If None (default), produces a naive timestamp.
+        tz: Optional timezone to annotate date64 columns with (date64 carries no timezone).
+            Existing timestamp columns keep their own timezone.
 
     Returns:
-        A new table with date64 columns cast to timestamp[us] (optionally tz-aware),
-        or the original table if no date64 columns were found.
+        A new table with the temporal columns cast to microsecond precision, or the original
+        table if there was nothing to cast.
     """
     arrays, fields = [], []
     changed = False
 
     for col, fld in zip(tbl.columns, tbl.schema):
-        if pyarrow.types.is_date64(fld.type):
-            changed = True
-            unit = "us"
-            new_type = pyarrow.timestamp(unit, tz)
-            # Rescale from ms (date64) to us (timestamp).
-            arrays.append(pyarrow.compute.cast(col, new_type))
-            fields.append(pyarrow.field(fld.name, new_type, fld.nullable, fld.metadata))
+        col_type = fld.type
+        if pyarrow.types.is_date64(col_type):
+            # date64 is milliseconds since epoch; rescale to us and optionally annotate tz
+            new_type = pyarrow.timestamp("us", tz)
+        elif pyarrow.types.is_timestamp(col_type) and col_type.unit == "ns":
+            # truncate ns timestamps to us, keeping the column's own timezone (other units kept)
+            new_type = pyarrow.timestamp("us", col_type.tz)
+        elif pyarrow.types.is_time64(col_type) and col_type.unit == "ns":
+            new_type = pyarrow.time64("us")
         else:
             arrays.append(col)
             fields.append(fld)
+            continue
+
+        changed = True
+        # safe=False truncates sub-us precision (lossless here: source DBs carry no nanoseconds)
+        arrays.append(pyarrow.compute.cast(col, new_type, safe=False))
+        fields.append(pyarrow.field(fld.name, new_type, fld.nullable, fld.metadata))
 
     if not changed:
         return tbl

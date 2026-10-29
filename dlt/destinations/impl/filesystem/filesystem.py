@@ -1,7 +1,6 @@
 import posixpath
 import os
 import time as _time
-import orjson
 import base64
 from contextlib import contextmanager
 from types import TracebackType
@@ -14,6 +13,7 @@ from typing import (
     Optional,
     Tuple,
     Sequence,
+    Set,
     cast,
     Any,
     Dict,
@@ -28,7 +28,7 @@ from tenacity import (
     RetryCallState,
 )
 
-from dlt.common import logger, time, json, pendulum
+from dlt.common import logger, time, json
 from dlt.common.destination.utils import resolve_merge_strategy, resolve_replace_strategy
 from dlt.common.metrics import LoadJobMetrics
 from dlt.common.schema.exceptions import TableNotFound
@@ -37,17 +37,30 @@ from dlt.common.schema.typing import (
     C_DLT_LOADS_TABLE_LOAD_ID,
     TTableFormat,
     TTableSchemaColumns,
+    UPSERT_MERGE_STRATEGIES,
 )
 from dlt.common.storages.exceptions import (
     CurrentLoadPackageStateNotAvailable,
     NoMigrationPathException,
     UnsupportedStorageVersionException,
 )
-from dlt.common.storages.fsspec_filesystem import glob_files
-from dlt.common.time import ensure_pendulum_datetime_utc
+from dlt.common.storages.fsspec_filesystem import (
+    AZURE_BLOB_STORAGE_PROTOCOLS,
+    GCS_PROTOCOLS,
+    S3_PROTOCOLS,
+    glob_files,
+)
+from datetime import datetime, timezone
+
+from dlt.common.runners import create_thread_pool
+from dlt.common.time import ensure_datetime_in_tz
 from dlt.common.typing import ConfigValue, DictStrAny
 from dlt.common.schema import Schema, TSchemaTables
-from dlt.common.schema.utils import get_columns_names_with_prop, is_nested_table
+from dlt.common.schema.utils import (
+    get_columns_names_with_prop,
+    get_nested_tables,
+    is_nested_table,
+)
 from dlt.common.storages import FileStorage, fsspec_from_config
 from dlt.common.storages.load_package import (
     LoadJobInfo,
@@ -78,6 +91,7 @@ from dlt.common.destination.exceptions import (
     OpenTableCatalogNotSupported,
     OpenTableFormatNotSupported,
 )
+from dlt.common.exceptions import MissingDependencyException
 from dlt.common.schema.exceptions import SchemaCorruptedException
 from dlt.destinations.job_impl import (
     ReferenceFollowupJobRequest,
@@ -88,21 +102,30 @@ from dlt.destinations.impl.filesystem.configuration import (
     FilesystemDestinationClientConfiguration,
     HfFilesystemDestinationClientConfiguration,
 )
+from dlt.destinations.impl.filesystem.iceberg_adapter import (
+    TABLE_PROPERTIES_HINT,
+    get_partition_specs,
+)
 from dlt.destinations import path_utils
 from dlt.destinations.fs_client import FSClientBase
 from dlt.destinations.utils import (
     verify_schema_merge_disposition,
     verify_schema_replace_disposition,
+    verify_unsupported_merge_options,
 )
-
-if TYPE_CHECKING:
-    from dlt.destinations.impl.filesystem.iceberg_adapter import PartitionSpec
 
 CURRENT_VERSION: int = 2
 SUPPORTED_VERSIONS: set[int] = {1, CURRENT_VERSION}
 
 INIT_FILE_NAME = "init"
 FILENAME_SEPARATOR = "__"
+# s3 matches the botocore connection pool, sftp, gdrive and memory clients are not thread-safe
+DEFAULT_DELETE_WORKERS: Dict[str, int] = {
+    **{p: 10 for p in S3_PROTOCOLS},
+    **{p: 32 for p in GCS_PROTOCOLS},
+    **{p: 16 for p in AZURE_BLOB_STORAGE_PROTOCOLS},
+    "file": 8,
+}
 
 
 class FilesystemLoadJob(RunnableLoadJob):
@@ -132,10 +155,13 @@ class FilesystemLoadJob(RunnableLoadJob):
         self._job_client.fs_client.put_file(self._file_path, remote_path)
 
     @property
-    def load_package_timestamp(self) -> Optional[pendulum.DateTime]:
+    def load_package_timestamp(self) -> Optional[datetime]:
         # package state is optional
         try:
-            return ensure_pendulum_datetime_utc(current_load_package()["state"]["created_at"])
+            # UTC, never the context timezone: this timestamp renders into the object path
+            return ensure_datetime_in_tz(
+                current_load_package()["state"]["created_at"], timezone.utc
+            )
         except CurrentLoadPackageStateNotAvailable:
             return None
 
@@ -201,8 +227,7 @@ class TableFormatLoadFilesystemJob(ReferenceFollowupJob):
 
 class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
     def run(self) -> None:
-        # create Arrow dataset from Parquet files
-        from dlt.common.libs.pyarrow import pyarrow as pa
+        from dlt.common.libs.pyarrow import pyarrow as pa, get_local_dataset_reader
         from dlt.common.libs.deltalake import (
             write_delta_table,
             merge_delta_table,
@@ -214,7 +239,6 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
             f"Will copy file(s) {self.file_paths} to delta table {self.make_remote_url()} [arrow"
             f" buffer: {pa.total_allocated_bytes()}]"
         )
-        source_ds = self.arrow_dataset
         storage_options = deltalake_storage_options(
             self._job_client.config.credentials,
             self._job_client.config.deltalake_storage_options,
@@ -226,7 +250,7 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
         except DestinationUndefinedEntity:
             delta_table = None
 
-        with source_ds.scanner().to_reader() as arrow_rbr:  # RecordBatchReader
+        with get_local_dataset_reader(self.file_paths) as arrow_rbr:  # RecordBatchReader
             if self._load_table["write_disposition"] == "merge" and delta_table is not None:
                 merge_delta_table(
                     table=delta_table,
@@ -246,7 +270,6 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
                     configuration=self._job_client.config.deltalake_configuration,
                 )
         # release memory ASAP by deleting objects explicitly
-        del source_ds
         del delta_table
         logger.info(
             f"Copied {self.file_paths} to delta table {self.make_remote_url()} [arrow buffer:"
@@ -261,9 +284,6 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             merge_iceberg_table,
             create_table,
         )
-        from dlt.destinations.impl.filesystem.iceberg_partition_spec import (
-            build_iceberg_partition_spec,
-        )
 
         try:
             table = self._job_client.load_open_table(
@@ -272,12 +292,9 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                 schema=self.arrow_dataset.schema,
             )
         except DestinationUndefinedEntity:
-            from dlt.destinations.impl.filesystem.iceberg_adapter import TABLE_PROPERTIES_HINT
-
             location = self._job_client.get_open_table_location("iceberg", self.load_table_name)
             table_id = f"{self._job_client.dataset_name}.{self.load_table_name}"
 
-            spec_list = self._get_partition_spec_list()
             # merge config-level defaults with per-table adapter overrides
             config_properties = self._job_client.config.iceberg_table_properties
             adapter_properties: Optional[Dict[str, str]] = self._load_table.get(
@@ -288,26 +305,17 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             else:
                 properties = None
 
-            if spec_list:
-                partition_spec, iceberg_schema = build_iceberg_partition_spec(
-                    self.arrow_dataset.schema, spec_list
-                )
-                create_table(
-                    self._job_client.get_open_table_catalog("iceberg"),
-                    table_id,
-                    table_location=location,
-                    schema=iceberg_schema,
-                    partition_spec=partition_spec,
-                    properties=properties,
-                )
-            else:
-                create_table(
-                    self._job_client.get_open_table_catalog("iceberg"),
-                    table_id,
-                    table_location=location,
-                    schema=self.arrow_dataset.schema,
-                    properties=properties,
-                )
+            create_table(
+                self._job_client.get_open_table_catalog("iceberg"),
+                table_id,
+                table_location=location,
+                schema=self.arrow_dataset.schema,
+                properties=properties,
+                partition_fields=[
+                    (spec.source_column, spec.get_transform(), spec.partition_field)
+                    for spec in get_partition_specs(self._load_table, self._schema.name)
+                ],
+            )
             # run again with created table
             self.run()
             return
@@ -325,30 +333,6 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                 data=self.arrow_dataset.to_table(),
                 write_disposition=self._load_table["write_disposition"],
             )
-
-    def _get_partition_spec_list(self) -> List["PartitionSpec"]:
-        """Resolve partition specs. Combines legacy partition columns (identity transform)
-        with partition hints. Validates that identity partitions are not duplicated.
-        """
-        from dlt.destinations.impl.filesystem.iceberg_adapter import (
-            parse_partition_hints,
-            create_identity_specs,
-        )
-
-        legacy_columns = self._partition_columns
-
-        hint_specs = parse_partition_hints(self._load_table)
-
-        for spec in hint_specs:
-            if spec.transform == "identity" and spec.source_column in legacy_columns:
-                raise SchemaCorruptedException(
-                    self._schema.name,
-                    f"Column '{spec.source_column}' is defined both as a partition column "
-                    "and in partition hints.",
-                )
-
-        identity_specs = create_identity_specs(legacy_columns)
-        return identity_specs + hint_specs
 
 
 class HfFilesystemUploadJob(HasFollowupJobs, FilesystemLoadJob):
@@ -527,11 +511,18 @@ class FilesystemClient(
         self.config: FilesystemDestinationClientConfiguration = config
         # verify files layout. we need {table_name} and only allow {schema_name} before it, otherwise tables
         # cannot be replaced and we cannot initialize folders consistently
-        self.table_prefix_layout = path_utils.get_table_prefix_layout(config.layout)
+        self.table_prefix_layout = path_utils.get_table_prefix_layout(
+            config.layout,
+            naming=self.schema.naming if config.warn_unsafe_layout_separators else None,
+        )
         self.dataset_name = self.config.normalize_dataset_name(self.schema)
         self._sql_client: SqlClientBase[Any] = None
         # iceberg catalog
         self._catalog: Any = None
+        # dataset names with namespaces created in the catalog
+        self._catalog_namespaces: Set[str] = set()
+        # tables receiving data files in this load, set in `verify_schema`
+        self._tables_with_jobs: Set[str] = set()
 
         # storage versions
         self._cached_initial_storage_version: int = None
@@ -605,8 +596,12 @@ class FilesystemClient(
         if truncate_tables and self.fs_client.isdir(self.dataset_path):
             # get all dirs with table data to delete. the table data are guaranteed to be files in those folders
             # TODO: when we do partitioning it is no longer the case and we may remove folders below instead
-            logger.info(f"Will truncate tables {truncate_tables}")
-            self.truncate_tables(list(truncate_tables))
+            truncate_names = [
+                t for t in truncate_tables if not self._replaced_atomically_in_load(t)
+            ]
+            if truncate_names:
+                logger.info(f"Will truncate tables {truncate_names}")
+                self.truncate_tables(truncate_names)
 
         # check if init file already exists
         if self.fs_client.exists(self.init_file_path):
@@ -671,7 +666,7 @@ class FilesystemClient(
             version_dict: Dict[str, int] = json.loads(version_info_str)
             initial_version: int = version_dict["initial_version"]
             current_version: int = version_dict["current_version"]
-        except (KeyError, orjson.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
                 f"Invalid content in {self.init_file_path}: {version_info_str!r}"
             ) from exc
@@ -687,13 +682,42 @@ class FilesystemClient(
         return initial_version, current_version
 
     def drop_tables(self, *tables: str, delete_schema: bool = True) -> None:
-        self.truncate_tables(list(tables))
+        wipe_names = [t for t in tables if not self._drop_open_table_in_catalog(t)]
+        if wipe_names:
+            self._delete_table_files(wipe_names)
         if not delete_schema:
             return
         # Delete all stored schemas
         for filename, fileparts in self._iter_stored_schema_files():
             if fileparts[0] == self.schema.name:
                 self._delete_file(filename)
+
+    def _drop_open_table_in_catalog(self, table_name: str) -> bool:
+        """Drops iceberg tables from a persistent catalog. Returns True when the catalog also
+        handles file deletion; caller deletes table files otherwise."""
+        if table_name in self.schema.tables:
+            if not self.is_open_table("iceberg", table_name):
+                return False
+        else:
+            # dropped tables may be gone from the schema, detect iceberg via the metadata dir
+            metadata_dir = self.pathlib.join(self.get_table_dir(table_name), "metadata")
+            if not self.fs_client.exists(metadata_dir):
+                return False
+        try:
+            from dlt.common.libs.pyiceberg import is_ephemeral_catalog, drop_iceberg_table
+        except MissingDependencyException:
+            return False
+
+        catalog = self.get_open_table_catalog("iceberg")
+        if is_ephemeral_catalog(catalog):
+            return False
+        dropped = drop_iceberg_table(
+            catalog,
+            f"{self.dataset_name}.{table_name}",
+            purge=self.config.iceberg_use_catalog_purge,
+        )
+        # without catalog purge dlt deletes the table files itself
+        return dropped and self.config.iceberg_use_catalog_purge
 
     def get_storage_tables(
         self, table_names: Iterable[str]
@@ -718,22 +742,76 @@ class FilesystemClient(
     def get_storage_table(self, table_name: str) -> Tuple[str, TTableSchemaColumns]:
         return list(self.get_storage_tables([table_name]))[0]
 
+    def _replaced_atomically_in_load(self, table_name: str) -> bool:
+        """Open tables with data jobs and replace disposition are overwritten atomically by
+        their load job and must not be truncated up front."""
+        if table_name not in self._tables_with_jobs:
+            return False
+        try:
+            table = self.prepare_load_table(table_name)
+        except TableNotFound:
+            return False
+        return (
+            table.get("table_format") in ("delta", "iceberg")
+            and table["write_disposition"] == "replace"
+        )
+
     def truncate_tables(self, table_names: List[str]) -> None:
-        """Truncate a set of regular tables with given `table_names`"""
+        """Truncates tables. Delta tables and iceberg tables in a persistent catalog are emptied
+        with a transactional delete that preserves the table and its history; all other tables
+        get their files deleted."""
+        wipe_names: List[str] = []
+        for table_name in table_names:
+            truncated = False
+            for table_format in ("delta", "iceberg"):
+                if self.is_open_table(table_format, table_name):
+                    truncated = self._truncate_open_table(table_format, table_name)
+                    break
+            if not truncated:
+                wipe_names.append(table_name)
+        if wipe_names:
+            self._delete_table_files(wipe_names)
+
+    def _truncate_open_table(self, table_format: TTableFormat, table_name: str) -> bool:
+        """Returns False when transactional truncate does not apply so caller falls back to
+        deleting table files."""
+        if table_format == "iceberg":
+            from dlt.common.libs.pyiceberg import is_ephemeral_catalog, truncate_iceberg_table
+
+            # ephemeral catalog tables are not tracked between loads, delete files instead
+            if is_ephemeral_catalog(self.get_open_table_catalog("iceberg")):
+                return False
+        try:
+            table = self.load_open_table(table_format, table_name)
+        except DestinationUndefinedEntity:
+            return False
+        if table_format == "delta":
+            from dlt.common.libs.deltalake import truncate_delta_table
+
+            truncate_delta_table(table)
+        else:
+            truncate_iceberg_table(table)
+        return True
+
+    def _delete_table_files(self, table_names: List[str]) -> None:
+        """Deletes all files belonging to `table_names`, including open table metadata and
+        transaction logs."""
         table_dirs = set(self.get_table_dirs(table_names))
         table_prefixes = [self.get_table_prefix(t) for t in table_names]
+        files: List[str] = []
         for table_dir in table_dirs:
             if self.fs_client.exists(table_dir):
-                for table_file in self.list_files_with_prefixes(table_dir, table_prefixes):
-                    # NOTE: deleting in chunks on s3 does not raise on access denied, file non existing and probably other errors
-                    # print(f"DEL {table_file}")
-                    try:
-                        self._delete_file(table_file)
-                    except FileNotFoundError:
-                        logger.info(
-                            f"Directory or path to truncate tables {table_names} does not exist but"
-                            " it should have been created previously!"
-                        )
+                files.extend(self.list_files_with_prefixes(table_dir, table_prefixes))
+        self._delete_files(files)
+
+    def _delete_files(self, files: List[str]) -> None:
+        # s3 bulk delete does not report errors like access denied, so dlt deletes files one by one
+        workers = self.config.max_delete_workers or DEFAULT_DELETE_WORKERS.get(
+            self.config.protocol, 1
+        )
+        with create_thread_pool(min(workers, len(files))) as pool:
+            # the list call consumes the iterator and raises the first error
+            list(pool.map(self._delete_file, files))
 
     def _delete_file(self, file_path: str) -> None:
         try:
@@ -772,10 +850,18 @@ class FilesystemClient(
     def verify_schema(
         self, only_tables: Iterable[str] = None, new_jobs: Iterable[ParsedLoadJobFileName] = None
     ) -> List[PreparedTableSchema]:
+        self._tables_with_jobs = {job.table_name for job in new_jobs or ()}
         loaded_tables = super().verify_schema(only_tables, new_jobs)
         # TODO: finetune verify_schema_merge_disposition ie. hard deletes are not supported
+        # Delta merge predicates name the merged tables by their `source` and `target` aliases
         if exceptions := verify_schema_merge_disposition(
-            self.schema, loaded_tables, self.capabilities, warnings=True
+            self.schema,
+            loaded_tables,
+            self.capabilities,
+            warnings=True,
+            # the source filter selects the merge source, so it cannot read the target
+            source_filter_placeholders=("staging_table",),
+            destination_scope_placeholders=("table",),
         ):
             # filesystem falls back to append when merge is not supported
             filtered = []
@@ -817,23 +903,97 @@ class FilesystemClient(
                 if self.config.protocol == "hf":
                     message = "the `hf` protocol does not support table formats"
                 exception_log.append(TableFormatNotSupported(table_format, table["name"], message))
+            if table_format == "delta":
+                merge_strategy = resolve_merge_strategy(
+                    self.schema.tables, table, self.capabilities
+                )
+                # the job merges each Delta table alone, so root row conditions miss nested rows
+                has_nested_tables = bool(
+                    get_nested_tables(self.schema.tables, table["name"], include_self=False)
+                )
+                if merge_strategy == "cdc":
+                    if get_columns_names_with_prop(table, "merge_key"):
+                        # `merge_key` selects rows by staged values with a subquery. Delta
+                        # predicates have no subqueries
+                        exception_log.append(
+                            SchemaCorruptedException(
+                                self.schema.name,
+                                "dlt does not support `merge_key` with the `cdc` merge strategy"
+                                f" on Delta table `{table['name']}`. Use `destination_scope`"
+                                " instead.",
+                            )
+                        )
+                # upsert has no destination scope
+                has_merge_conditions = "x-merge-source-filter" in table or (
+                    merge_strategy == "cdc" and "x-merge-destination-scope" in table
+                )
+                if (
+                    merge_strategy in UPSERT_MERGE_STRATEGIES
+                    and has_nested_tables
+                    and has_merge_conditions
+                ):
+                    exception_log.append(
+                        SchemaCorruptedException(
+                            self.schema.name,
+                            "dlt does not support `source_filter` or `destination_scope` with the"
+                            f" `{merge_strategy}` merge strategy on Delta table `{table['name']}`."
+                            " The table has nested tables. Remove the merge conditions or the"
+                            " nested data.",
+                        )
+                    )
+                if (
+                    merge_strategy in UPSERT_MERGE_STRATEGIES
+                    and has_nested_tables
+                    and get_columns_names_with_prop(table, "hard_delete")
+                ):
+                    exception_log.append(
+                        SchemaCorruptedException(
+                            self.schema.name,
+                            "dlt does not support the `hard_delete` hint with the"
+                            f" `{merge_strategy}` merge strategy on Delta table `{table['name']}`."
+                            " The table has nested tables. Remove the `hard_delete` hint or the"
+                            " nested data.",
+                        )
+                    )
+            elif table_format == "iceberg":
+                # pyiceberg merges Arrow data: it cannot apply a SQL condition and it compares
+                # all columns, `_dlt_load_id` included, so every row changes
+                exception_log.extend(
+                    verify_unsupported_merge_options(
+                        self.schema,
+                        [table],
+                        self.capabilities,
+                        "iceberg",
+                        ("source_filter", "skip_unchanged_rows"),
+                    )
+                )
         return exception_log
 
     def update_stored_schema(
         self,
         only_tables: Iterable[str] = None,
         expected_update: TSchemaTables = None,
+        force: bool = False,
+        include_existing_tables: bool = False,
     ) -> TSchemaTables:
-        applied_update = super().update_stored_schema(only_tables, expected_update)
+        applied_update = super().update_stored_schema(
+            only_tables, expected_update, force, include_existing_tables
+        )
 
         # don't store schema when used as staging
         if not self.config.as_staging_destination:
             # check if schema with hash exists
             current_hash = self.schema.stored_version_hash
-            if not self._get_stored_schema_by_hash_or_newest(current_hash):
+            stored = self._get_stored_schema_by_hash_or_newest(current_hash)
+            if not stored or force:
                 logger.info(
                     f"Schema with hash {self.schema.stored_version_hash} not found in the storage."
                     " upgrading"
+                    if not stored
+                    else (
+                        f"Schema with hash {self.schema.stored_version_hash} found in storage but"
+                        " update is enforced (tables to truncate/drop), ensuring table dirs"
+                    )
                 )
                 # create destination dirs for all tables
                 # TODO: find only tables with changes
@@ -841,7 +1001,9 @@ class FilesystemClient(
                 dirs_to_create = self.get_table_dirs(table_names)
                 for _, directory in zip(table_names, dirs_to_create):
                     self.fs_client.makedirs(directory, exist_ok=True)
-                self._update_schema_in_storage(self.schema)
+                # do not write a duplicate schema file when the hash is already stored
+                if not stored:
+                    self._update_schema_in_storage(self.schema)
 
         # we assume that expected_update == applied_update so table schemas in dest were not
         # externally changed
@@ -892,8 +1054,20 @@ class FilesystemClient(
             # it is crucial to append and keep "/" at the end
             table_prefix = self.pathlib.join(table_name, "")
         else:
+            prefix_placeholders = set(path_utils.get_placeholders(self.table_prefix_layout))
+            prefix_extra_placeholders = {
+                key: value
+                for key, value in (self.config.extra_placeholders or {}).items()
+                if key in prefix_placeholders
+            }
+            params = path_utils.prepare_params(
+                extra_placeholders=prefix_extra_placeholders,
+                schema_name=schema_name or self.schema.name,
+                table_name=table_name,
+            )
             table_prefix = self.table_prefix_layout.format(
-                schema_name=schema_name or self.schema.name, table_name=table_name
+                schema_name=params.get("schema_name", schema_name or self.schema.name),
+                table_name=params.get("table_name", table_name),
             )
         return self.pathlib.join(  # type: ignore[no-any-return]
             self.dataset_path, path_utils.normalize_path_sep(self.pathlib, table_prefix)
@@ -991,13 +1165,6 @@ class FilesystemClient(
     def should_load_data_to_staging_dataset(self, table_name: str) -> bool:
         return False
 
-    def should_truncate_table_before_load(self, table_name: str) -> bool:
-        table = self.prepare_load_table(table_name)
-        return table["write_disposition"] == "replace" and not table.get("table_format") in (
-            "delta",
-            "iceberg",
-        )  # Delta/Iceberg can do a logical replace
-
     #
     # state stuff
     #
@@ -1034,7 +1201,7 @@ class FilesystemClient(
             C_DLT_LOADS_TABLE_LOAD_ID: load_id,
             "schema_name": self.schema.name,
             "status": 0,
-            "inserted_at": pendulum.now().isoformat(),
+            "inserted_at": datetime.now(timezone.utc).isoformat(),
             "schema_version_hash": self.schema.version_hash,
         }
         filepath = self.pathlib.join(
@@ -1174,7 +1341,8 @@ class FilesystemClient(
 
             if selected_path:
                 info = json.loads(self.fs_client.read_text(selected_path, encoding="utf-8"))
-                info["inserted_at"] = ensure_pendulum_datetime_utc(info["inserted_at"])
+                # UTC, never the context timezone: runs compare these across each other
+                info["inserted_at"] = ensure_datetime_in_tz(info["inserted_at"], timezone.utc)
                 return StorageSchemaInfo(**info)
         except DestinationUndefinedEntity:
             # ignore missing table
@@ -1193,7 +1361,7 @@ class FilesystemClient(
             "schema_name": schema.name,
             "version": schema.version,
             "engine_version": schema.ENGINE_VERSION,
-            "inserted_at": pendulum.now(),
+            "inserted_at": datetime.now(timezone.utc),
             "schema": json.dumps(schema.to_dict()),
         }
 
@@ -1249,9 +1417,7 @@ class FilesystemClient(
                     file_name = FileStorage.get_file_name_from_file_path(job_file_paths[0])
                     jobs.append(ReferenceFollowupJobRequest(file_name, job_file_paths))
                 else:
-                    # file_name = ParsedLoadJobFileName(table["name"], "empty", 0, "reference").file_name()
-                    # TODO: if we implement removal od orphaned rows, we may need to propagate such job without files
-                    # to the delta load job
+                    # jobless tables in replace chains are truncated in `initialize_storage`
                     pass
             return jobs
 
@@ -1310,33 +1476,30 @@ class FilesystemClient(
         if table_format != "iceberg":
             raise OpenTableCatalogNotSupported(table_format, "filesystem")
 
-        if self._catalog:
-            return self._catalog
+        if not self._catalog:
+            from dlt.common.libs.pyiceberg import get_catalog
 
-        from dlt.common.libs.pyiceberg import get_catalog, IcebergCatalog
-        from pyiceberg.exceptions import NamespaceAlreadyExistsError
-
-        catalog: IcebergCatalog
-
-        # Try to load catalog using new function
-        catalog = self._catalog = get_catalog(
-            iceberg_catalog_name=catalog_name or ConfigValue,
-            credentials=self.config.credentials,
-        )
-
-        logger.info(f"Successfully loaded catalog '{catalog.name}' ")
-
-        # Create namespace
-        try:
-            catalog.create_namespace(
-                self.dataset_name,
-                properties=self.config.iceberg_namespace_properties or {},
+            self._catalog = get_catalog(
+                iceberg_catalog_name=catalog_name or ConfigValue,
+                credentials=self.config.credentials,
             )
-            logger.info(f"Created Iceberg namespace: {self.dataset_name}")
-        except NamespaceAlreadyExistsError as e:
-            logger.debug(f"Namespace {self.dataset_name} already exists or error: {e}")
+            logger.info(f"Successfully loaded catalog '{self._catalog.name}' ")
 
-        return catalog
+        # create namespace for the active dataset, main and staging dataset share the catalog
+        if self.dataset_name not in self._catalog_namespaces:
+            from pyiceberg.exceptions import NamespaceAlreadyExistsError
+
+            try:
+                self._catalog.create_namespace(
+                    self.dataset_name,
+                    properties=self.config.iceberg_namespace_properties or {},
+                )
+                logger.info(f"Created Iceberg namespace: {self.dataset_name}")
+            except NamespaceAlreadyExistsError as e:
+                logger.debug(f"Namespace {self.dataset_name} already exists or error: {e}")
+            self._catalog_namespaces.add(self.dataset_name)
+
+        return self._catalog
 
     def get_open_table_location(
         self, table_format: TTableFormat, table_name: str, schema_name: Optional[str] = None

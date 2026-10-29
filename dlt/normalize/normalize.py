@@ -1,14 +1,12 @@
 import os
-import itertools
 from typing import List, Dict, NamedTuple, Sequence, Set, Optional, Callable
 from concurrent.futures import Future, Executor
 
 from dlt.common import logger
-from dlt.common.metrics import DataWriterMetrics
+from dlt.common.metrics import DataWriterMetrics, aggregate_job_metrics
 from dlt.common.runtime.signals import sleep
 from dlt.common.configuration import with_config, known_sections
 from dlt.common.configuration.accessors import config
-from dlt.common.data_writers.writers import EMPTY_DATA_WRITER_METRICS
 from dlt.common.runners import TRunMetrics, Runnable, NullExecutor
 from dlt.common.runtime import signals
 from dlt.common.runtime.collector import Collector, NULL_COLLECTOR
@@ -233,12 +231,7 @@ class Normalize(Runnable[Executor], WithStepInfo[NormalizeMetrics, NormalizeInfo
         )
         # compute metrics
         job_metrics = {ParsedLoadJobFileName.parse(m.file_path): m for m in writer_metrics}
-        table_metrics: Dict[str, DataWriterMetrics] = {
-            table_name: sum(map(lambda pair: pair[1], metrics), EMPTY_DATA_WRITER_METRICS)
-            for table_name, metrics in itertools.groupby(
-                job_metrics.items(), lambda pair: pair[0].table_name
-            )
-        }
+        table_metrics = aggregate_job_metrics(job_metrics, lambda job: job.table_name)
         self._step_info_update_metrics(
             load_id,
             {
@@ -270,7 +263,8 @@ class Normalize(Runnable[Executor], WithStepInfo[NormalizeMetrics, NormalizeInfo
             logger.info(
                 f"Saving schema {schema.name} with version {schema.stored_version}:{schema.version}"
             )
-            self.schema_storage.save_schema(schema)
+            # import schema will relink on first use
+            self.schema_storage.save_schema(schema, link_import_schema=False)
         else:
             logger.info(
                 f"Schema {schema.name} with version {schema.version} was not modified. Save skipped"
@@ -341,8 +335,11 @@ class Normalize(Runnable[Executor], WithStepInfo[NormalizeMetrics, NormalizeInfo
             logger.info(
                 f"Found {len(schema_files)} files in schema {schema.name} load_id {load_id}"
             )
-            if len(schema_files) == 0:
-                # delete empty package
+            if not schema_files and self.normalize_storage.extracted_packages.is_empty_package(
+                load_id
+            ):
+                # package has no data and no refresh commands (tables to truncate / drop): drop it
+                # so it does not reach the load step. packages with refresh commands are kept
                 self.normalize_storage.extracted_packages.delete_package(load_id)
                 logger.info(f"Empty package {load_id} processed")
                 continue
@@ -354,11 +351,6 @@ class Normalize(Runnable[Executor], WithStepInfo[NormalizeMetrics, NormalizeInfo
 
         # return info on still pending packages (if extractor saved something in the meantime)
         return TRunMetrics(False, len(self.normalize_storage.extracted_packages.list_packages()))
-
-    # def verify_package(self, load_id, schema: Schema, schema_files: Sequence[str]) -> None:
-    #     """Verifies package schema and jobs against destination capabilities"""
-    #     # get all tables in schema files
-    #     table_names = set(ParsedLoadJobFileName.parse(job).table_name for job in schema_files)
 
     def get_load_package_info(self, load_id: str) -> LoadPackageInfo:
         """Returns information on extracted/normalized/completed package with given load_id, all jobs and their statuses."""

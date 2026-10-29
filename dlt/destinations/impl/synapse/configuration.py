@@ -3,6 +3,7 @@ from dlt import version
 from typing import Final, Any, List, Dict, Optional, ClassVar
 
 from dlt.common.configuration import configspec
+from dlt.common.destination.client import DestinationClientConfiguration
 
 from dlt.destinations.impl.mssql.configuration import (
     MsSqlCredentials,
@@ -45,7 +46,7 @@ class SynapseClientConfiguration(MsSqlClientConfiguration):
     """
 
     # Set to False by default because the PRIMARY KEY and UNIQUE constraints
-    # are tricky in Synapse: they are NOT ENFORCED and can lead to innacurate
+    # are tricky in Synapse: they are NOT ENFORCED and can lead to inaccurate
     # results if the user does not ensure all column values are unique.
     # https://learn.microsoft.com/en-us/azure/synapse-analytics/sql-data-warehouse/sql-data-warehouse-table-constraints
     create_indexes: bool = False
@@ -59,3 +60,10 @@ class SynapseClientConfiguration(MsSqlClientConfiguration):
         "create_indexes",
         "staging_use_msi",
     ]
+
+    def data_location(self) -> str:
+        """Returns host:port and the database. Synapse has no cross-database joins, unlike mssql."""
+        host = super().data_location()
+        if not self.credentials.database:
+            self._no_data_location("the configuration has no database")
+        return f"{host}/{self.credentials.database}"

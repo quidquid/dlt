@@ -5,61 +5,26 @@ DuckDB instance with the `lance-duckdb` extension allows
 to read the `.lance` files (each maps to a single table).
 
 This SQL client makes LanceDB compatible with the `dlt.Dataset`
-inferface.
+interface.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
 from packaging import version as pkg_version
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
-import sqlglot
-import sqlglot.expressions as exp
 import duckdb
 
+from dlt.common.schema import Schema
 from dlt.destinations.exceptions import DatabaseUndefinedRelation
-from dlt.common.destination.dataset import DBApiCursor
-from dlt.common.destination.capabilities import DestinationCapabilitiesContext
-from dlt.destinations.sql_client import raise_database_error, raise_open_connection_error
-from dlt.destinations.impl.duckdb.sql_client import DuckDbSqlClient
-from dlt.destinations.impl.duckdb.factory import _set_duckdb_raw_capabilities
+from dlt.destinations.impl.duckdb.configuration import ConnStatement
+from dlt.destinations.impl.duckdb.sql_client import WithTableScanners
+from dlt.destinations.impl.lance.sql_client import _prepare_create_lance_secret_statement
 
 if TYPE_CHECKING:
-    from sqlglot import expressions as sge
     from duckdb import DuckDBPyConnection
 
+    from dlt.common.destination.typing import PreparedTableSchema
     from dlt.destinations.impl.lancedb.lancedb_client import LanceDBClient
-
-
-def _get_lancedb_sql_capabilities() -> DestinationCapabilitiesContext:
-    caps = DestinationCapabilitiesContext()
-    caps = _set_duckdb_raw_capabilities(caps)
-    caps.preferred_loader_file_format = "parquet"
-    return caps
-
-
-def _install_and_load_lance_duckdb_extension(duckdb_con: DuckDBPyConnection) -> None:
-    """Ensure the `lance-duckdb` extension is loaded.
-
-    DuckDB ensures installation is only done once per system.
-    Extension loading must be done on every connection
-    """
-    duckdb_version = pkg_version.parse(duckdb.__version__)
-    if duckdb_version >= pkg_version.Version("1.5.0"):
-        install_extension_cmd = "INSTALL lance;"
-    else:
-        install_extension_cmd = "INSTALL lance FROM community;"
-
-    duckdb_con.execute(install_extension_cmd)
-    duckdb_con.execute("LOAD lance;")
-
-
-def _create_and_use_duckdb_dataset(
-    duckdb_con: DuckDBPyConnection, dataset_qualified_name: str
-) -> None:
-    """Create a schema in the ephemeral DuckDB client that matches the `dlt` dataset name."""
-    create_schema_sql = f"CREATE SCHEMA IF NOT EXISTS {dataset_qualified_name}"
-    duckdb_con.execute(f"{create_schema_sql}; USE {dataset_qualified_name}")
 
 
 def get_lance_table_uri(lancedb_client: LanceDBClient, table_name: str) -> str:
@@ -75,79 +40,59 @@ def get_lance_table_uri(lancedb_client: LanceDBClient, table_name: str) -> str:
     return f"{dataset_lance_uri}/{qualified_table_name}.lance"
 
 
-def _prepare_create_view_statement(lance_table_uri: str, view_name: str) -> str:
-    return f'CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM "{lance_table_uri}"'
-
-
-class LanceDBSQLClient(DuckDbSqlClient):
+class LanceDBSQLClient(WithTableScanners):
     def __init__(self, lancedb_client: LanceDBClient) -> None:
         self.lancedb_client = lancedb_client
+        # schema-less (no dataset_name): host the read views in the ephemeral duckdb `main` schema
         super().__init__(
-            dataset_name=self.lancedb_client.dataset_name,
-            staging_dataset_name=None,
-            credentials=None,  # duckdb doesn't need special credentials
-            capabilities=_get_lancedb_sql_capabilities(),
+            remote_client=lancedb_client, dataset_name=lancedb_client.dataset_name or "main"
         )
-        self._conn: DuckDBPyConnection | None = None
+        self.credentials.conn_pool.add_statements(
+            [ConnStatement(sql) for sql in self._attach_extension_statements()]
+        )
 
-    @raise_open_connection_error
-    def open_connection(self) -> DuckDBPyConnection:
-        if self._conn:
-            return self._conn
+    def can_create_view(self, table_schema: PreparedTableSchema) -> bool:
+        return True
 
-        self._conn = duckdb.connect(":memory:")
-        _install_and_load_lance_duckdb_extension(self._conn)
+    def should_replace_view(self, view_name: str, table_schema: PreparedTableSchema) -> bool:
+        # views must be refreshed when schema evolves
+        return self.lancedb_client.config.always_refresh_views
 
-        # by default, LanceDB has `dataset_name=None`. To be consistent, it uses DuckDB's
-        # main schema by default
-        if self.lancedb_client.dataset_name:
-            _create_and_use_duckdb_dataset(self._conn, self.fully_qualified_dataset_name())
+    def create_views_for_tables(self, tables: Dict[str, str]) -> None:
+        # lance extension caches datasets so new data is not visible
+        # automatically, we duplicate connection to clear the cache
+        if self.lancedb_client.config.always_refresh_views:
+            self._conn = self.memory_db.duplicate()
+        super().create_views_for_tables(tables)
 
-        return self._conn
-
-    def close_connection(self) -> None:
-        if self._conn:
-            self._conn = None
-
-    @contextmanager
-    @raise_database_error
-    def execute_query(  # type: ignore[override]
-        self, query: str, *args: Any, **kwargs: Any
-    ) -> Iterator[DBApiCursor]:
-        # replace generic string placeholder by DuckDB placeholders
-        if args or kwargs:
-            query = query.replace("%s", "?")
-
-        expression: sge.Expression = sqlglot.maybe_parse(query)
-        for table in expression.find_all(exp.Table):
-            if not table.this:
-                continue
-
-            self.create_view(table.name)
-
-        with super().execute_query(query, *args, **kwargs) as cursor:
-            yield cursor
-
-    @raise_database_error
-    def create_view(self, table_name: str) -> None:
+    def create_view_select(
+        self, table_schema: PreparedTableSchema, schema: Schema = None
+    ) -> Optional[Tuple[str, str]]:
+        table_name = table_schema["name"]
         lance_table_uri = get_lance_table_uri(self.lancedb_client, table_name)
+        # the `lance` duckdb extension reads a `.lance` directory directly
+        return lance_table_uri, f'SELECT * FROM "{lance_table_uri}"'
 
-        # lancedb allows omitting the dataset_name, calling `make_qualified_table_name` will
-        # prepend the dataset_name even if it is None
-        if self.dataset_name:
-            view_name = self.make_qualified_table_name(table_name)
-        else:
-            view_name = self.capabilities.escape_identifier(
-                self.capabilities.casefold_identifier(table_name)
+    def _attach_extension_statements(self) -> List[str]:
+        # the extension left the community repository in duckdb 1.5.0
+        if pkg_version.parse(duckdb.__version__) >= pkg_version.Version("1.5.0"):
+            return ["INSTALL lance;", "LOAD lance;"]
+        return ["INSTALL lance FROM community;", "LOAD lance;"]
+
+    def _attach_secret_statements(self) -> List[str]:
+        storage_options = self.lancedb_client.config.credentials.storage_options
+        if not storage_options:
+            return []
+        scope = self.lancedb_client.config.lance_uri
+        return [
+            _prepare_create_lance_secret_statement(
+                self.create_secret_name(scope), scope, storage_options
             )
+        ]
 
-        create_view_sql = _prepare_create_view_statement(
-            lance_table_uri=lance_table_uri,
-            view_name=view_name,
-        )
-        try:
-            self._conn.execute(create_view_sql)
-        # Creating a DuckDB view will fail if the table doesn't exist in lance
-        # potential edge case: a table only exists in the ephemeral DuckDB
-        except duckdb.IOException as e:
-            raise DatabaseUndefinedRelation(e)
+    @classmethod
+    def _make_database_exception(cls, ex: Exception) -> Exception:
+        # a missing `.lance` directory means the table was not created yet in lancedb
+        if isinstance(ex, duckdb.IOException):
+            return DatabaseUndefinedRelation(ex)
+        return super()._make_database_exception(ex)

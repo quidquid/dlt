@@ -2,16 +2,21 @@ import os
 import dataclasses
 import sys
 from urllib.parse import urlencode
-from typing import Any, ClassVar, Dict, Final, List, TYPE_CHECKING
+from typing import Any, ClassVar, Dict, Final, List, Optional, TYPE_CHECKING
 
 from dlt.common.configuration.specs.connection_string_credentials import ConnectionStringCredentials
 from dlt.version import __version__
 from dlt.common.configuration import configspec
 from dlt.common.configuration.specs.exceptions import NativeValueError
-from dlt.common.destination.client import DestinationClientDwhWithStagingConfiguration
+from dlt.common.destination.attach import TAttachType
+from dlt.common.destination.client import (
+    DestinationClientConfiguration,
+    DestinationClientDwhWithStagingConfiguration,
+    WithAttachableEngine,
+)
 from dlt.common.destination.exceptions import DestinationTerminalException
-from dlt.common.typing import TSecretStrValue
 from dlt.common.utils import digest128
+from dlt.common.typing import TSecretStrValue
 
 from dlt.destinations.impl.duckdb.configuration import DuckDbBaseCredentials, DuckDbConnectionPool
 
@@ -113,7 +118,9 @@ class MotherDuckCredentials(DuckDbBaseCredentials, ConnectionStringCredentials):
 
 
 @configspec
-class MotherDuckClientConfiguration(DestinationClientDwhWithStagingConfiguration):
+class MotherDuckClientConfiguration(
+    WithAttachableEngine, DestinationClientDwhWithStagingConfiguration
+):
     destination_type: Final[str] = dataclasses.field(  # type: ignore
         default="motherduck", init=False, repr=False, compare=False
     )
@@ -123,11 +130,41 @@ class MotherDuckClientConfiguration(DestinationClientDwhWithStagingConfiguration
         False  # should unique indexes be created, this slows loading down massively
     )
 
+    def data_location(self) -> str:
+        """Returns the account. One query engine accesses every database of that account. The
+        token is the only account identity, so this method digests it."""
+        if not (token := self.fingerprint()):
+            self._no_data_location("dlt found no MotherDuck access token")
+        return f"md://{token}"
+
     def fingerprint(self) -> str:
-        """Returns a fingerprint of user access token"""
-        if self.credentials and self.credentials.password:
-            return digest128(self.credentials.password)
+        """Returns a fingerprint of user access token."""
+        if token := self._access_token():
+            return digest128(token)
         return ""
+
+    def _access_token(self) -> Optional[str]:
+        """Returns the token that the connection uses to authenticate. `on_partial` accepts this
+        token from the environment and from the credentials."""
+        if self.credentials and self.credentials.password:
+            return self.credentials.password
+        return os.environ.get(MOTHERDUCK_DEFAULT_TOKEN_ENV) or os.environ.get(
+            MOTHERDUCK_DEFAULT_TOKEN_ENV.upper()
+        )
+
+    def needs_attach(self, other: DestinationClientConfiguration) -> bool:
+        """Returns False within one account. The query engine accesses every database of that
+        account."""
+        return not self.is_same_location(other)
+
+    def attach_type(self) -> Optional[TAttachType]:
+        return "motherduck"
+
+    def can_attach(self, attach_type: TAttachType) -> bool:
+        """Returns True only for plain duckdb. A MotherDuck query engine cannot attach another
+        MotherDuck database, because the client must set the token before it opens the
+        connection."""
+        return attach_type == "duckdb"
 
 
 class MotherDuckCatalogMissing(NativeValueError):

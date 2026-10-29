@@ -3,7 +3,7 @@ import itertools
 import inspect
 import binascii
 import pytest
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List, Tuple
 from dlt.common.exceptions import PipelineException, TerminalValueError
 
 from dlt.common.runners import Venv
@@ -17,6 +17,7 @@ from dlt.common.utils import (
     is_typeerror_due_to_wrong_call,
     map_nested_values_in_place,
     map_nested_keys_in_place,
+    map_nested_dicts_in_place,
     reveal_pseudo_secret,
     obfuscate_pseudo_secret,
     get_module_name,
@@ -24,6 +25,7 @@ from dlt.common.utils import (
     increase_row_count,
     merge_row_counts,
     extend_list_deduplicated,
+    merge_keyed_groups,
     get_exception_trace,
     get_exception_trace_chain,
     update_dict_nested,
@@ -86,6 +88,36 @@ def test_map_dicts_in_place() -> None:
 
     with pytest.raises(ValueError):
         map_nested_keys_in_place(lambda k: k * 2, "a")
+
+
+@pytest.mark.parametrize(
+    "max_nesting,expected_order",
+    [(None, [1, 2, 3, 1]), (2, [1, 2, 1]), (0, [])],
+    ids=["all-levels", "two-levels", "no-levels"],
+)
+def test_map_nested_dicts_in_place(max_nesting: int, expected_order: List[int]) -> None:
+    """Maps the dicts in lists, recursing through dicts without counting a level. A list in a
+    list counts a level. A dict is mapped after its nested dicts and replaced by the result."""
+    _nested: Dict[str, Any] = {
+        "a": 1,
+        "d": {"l": [{"lvl": 1}]},
+        "l": [{"lvl": 1, "l": [{"lvl": 2}, "s", [{"lvl": 3}]]}],
+    }
+    order: List[int] = []
+
+    def _tag(d: Dict[str, Any], tag: str) -> Dict[str, Any]:
+        order.append(d["lvl"])
+        return {**d, "tag": tag}
+
+    assert map_nested_dicts_in_place(_tag, _nested, "x", max_nesting=max_nesting) is _nested
+    assert order == expected_order
+    # a dict in a dict is not mapped
+    assert "tag" not in _nested["d"]
+    tagged = {1: _nested["l"][0], 2: _nested["l"][0]["l"][0], 3: _nested["l"][0]["l"][2][0]}
+    assert {lvl for lvl, d in tagged.items() if d.get("tag") == "x"} == set(expected_order)
+
+    with pytest.raises(ValueError):
+        map_nested_dicts_in_place(_tag, "a")
 
 
 def test_pseudo_obfuscation() -> None:
@@ -238,6 +270,44 @@ def test_merge_row_counts() -> None:
     assert rc1 == {"table1": 3, "table2": 8, "table3": 20}
     merge_row_counts(rc1, {"table2": 5, "table3": 20, "table4": 2})
     assert rc1 == {"table1": 3, "table2": 13, "table3": 40, "table4": 2}
+
+
+def test_merge_keyed_groups_keeps_the_position_of_a_replaced_group() -> None:
+    """Order carries meaning for the callers (attach statements run in sequence). A replaced
+    group takes the place of the group that it supersedes. Only genuinely new keys go to the
+    end."""
+    key_f: Callable[[Tuple[str, str]], str] = lambda item: item[0]
+    original = [("ext", "load"), ("secret", "s1"), ("secret", "s2"), ("attach", "a"), ("v1", "v")]
+
+    # `merge_keyed_groups` swaps the whole group in place, however many items it had
+    merged, changed = merge_keyed_groups(original, [("secret", "rotated")], key_f)
+    assert merged == [("ext", "load"), ("secret", "rotated"), ("attach", "a"), ("v1", "v")]
+    assert changed == [("secret", "rotated")]
+
+    # a new key lands at the end, behind everything that was already there
+    merged, changed = merge_keyed_groups(original, [("v2", "w")], key_f)
+    assert merged == original + [("v2", "w")]
+    assert changed == [("v2", "w")]
+
+    # one call that replaces and adds keeps both rules
+    merged, _ = merge_keyed_groups(original, [("secret", "rotated"), ("v2", "w")], key_f)
+    assert merged == [
+        ("ext", "load"),
+        ("secret", "rotated"),
+        ("attach", "a"),
+        ("v1", "v"),
+        ("v2", "w"),
+    ]
+
+    # `merge_keyed_groups` does not move an unchanged group and reports no change
+    merged, changed = merge_keyed_groups(original, [("attach", "a")], key_f)
+    assert merged == original
+    assert changed == []
+
+    # a group scattered through the list collapses onto its first position
+    scattered = [("k1", "a"), ("k2", "b"), ("k1", "c")]
+    merged, _ = merge_keyed_groups(scattered, [("k1", "new")], key_f)
+    assert merged == [("k1", "new"), ("k2", "b")]
 
 
 def test_extend_list_deduplicated() -> None:

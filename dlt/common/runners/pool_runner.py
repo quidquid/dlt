@@ -36,7 +36,9 @@ class NullExecutor(Executor):
         fut: Future[T] = Future()
         try:
             result = fn(*args, **kwargs)
-        except BaseException as exc:
+        # mirror concurrent.futures: capture any error (incl. BaseException) onto the Future,
+        # to be re-raised by Future.result()
+        except BaseException as exc:  # noqa: B036
             fut.set_exception(exc)
         else:
             fut.set_result(result)
@@ -124,10 +126,14 @@ def _detect_orchestrator() -> Optional[str]:
 
 
 def get_default_start_method(method_: str) -> str:
-    """Sets method to `spawn` if running in one of orchestrator tasks.
+    """Normalizes the system default start method for dlt pools.
 
     Called when explicit start method is not set on `PoolRunnerConfiguration`
     """
+
+    if method_ == "forkserver":
+        logger.info("Switching pool start method from `forkserver` to `fork`")
+        method_ = "fork"
     if method_ == "fork":
         detected = _detect_orchestrator()
         if detected is not None:
@@ -199,6 +205,20 @@ def create_pool(config: PoolRunnerConfiguration) -> Executor:
         f" {config.workers or 'default no.'} workers"
     )
     return executor
+
+
+def create_thread_pool(
+    max_workers: int, thread_name_prefix: str = None, timeout: float = None
+) -> Executor:
+    """Creates a thread pool with `max_workers` threads. Returns `NullExecutor` that runs jobs
+    inline when the platform has no threads or a single worker is requested."""
+    if max_workers <= 1 or not platform_supports_threading():
+        return NullExecutor()
+    return TimeoutThreadPoolExecutor(
+        max_workers,
+        timeout=timeout,
+        thread_name_prefix=thread_name_prefix or Container.thread_pool_prefix(),
+    )
 
 
 _MAIN_FIXUP_LOCK = threading.Lock()

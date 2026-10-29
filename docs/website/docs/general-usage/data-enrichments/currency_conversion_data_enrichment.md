@@ -3,7 +3,6 @@ title:  Currency-conversion data enrichment
 description: Converting the monetary value in one currency to another using the latest market rates.
 keywords: [data enrichment, currency conversion, latest market rates]
 ---
-
 # Data enrichment part two: Currency conversion data enrichment
 
 Currency conversion data enrichment means adding additional information to currency-related data.
@@ -61,18 +60,18 @@ currency_conversion_enrichment/
 1. The last part of our data enrichment ([part one](../../general-usage/data-enrichments/user_agent_device_data_enrichment.md))
    involved enriching the data with user-agent device data. This included adding two new columns to the dataset as follows:
 
-   - `device_price_usd`: average price of the device in USD.
+  - `device_price_usd`: average price of the device in USD.
 
-   - `price_updated_at`: time at which the price was updated.
+  - `price_updated_at`: time at which the price was updated.
 
 1. The columns initially present prior to the data enrichment were:
 
-   - `user_id`: Web trackers typically assign a unique ID to users for tracking their journeys and
+  - `user_id`: Web trackers typically assign a unique ID to users for tracking their journeys and
      interactions over time.
 
-   - `device_name`: User device information helps in understanding the user base's device.
+  - `device_name`: User device information helps in understanding the user base's device.
 
-   - `page_referer`: The referer URL is tracked to analyze traffic sources and user navigation
+  - `page_referer`: The referer URL is tracked to analyze traffic sources and user navigation
      behavior.
 
 1. Here's the resource that yields the sample data as discussed above:
@@ -121,7 +120,12 @@ API token.
 1. Create the `converted_amount` function as follows:
 
    ```py
-   # @transformer(data_from=enriched_data_part_two)
+   import datetime
+
+   import dlt
+   import requests
+
+   # @dlt.transformer(data_from=enriched_data_part_two)
    def converted_amount(record):
         """
         Converts an amount from base currency to target currency using the latest exchange rate.
@@ -131,7 +135,7 @@ API token.
         if the current rate is over 12 hours old.
 
         Args:
-            record (dict): A dictionary containing the 'amount' key with the value to be converted.
+            record (dict): A dictionary containing the 'device_price_usd' key with the value to be converted.
 
         Yields:
             dict: A dictionary containing the original amount in USD, converted amount in EUR,
@@ -159,21 +163,21 @@ API token.
 
         # Update the exchange rate if it's older than 12 hours
         if (currency_pair_state.get("rate") is None or
-            (datetime.datetime.utcnow() - currency_pair_state["last_update"] >= datetime.timedelta(hours=12))):
+            (datetime.datetime.now(datetime.timezone.utc) - currency_pair_state["last_update"] >= datetime.timedelta(hours=12))):
             url = f"https://v6.exchangerate-api.com/v6/{api_key}/pair/{base_currency}/{target_currency}"
             response = requests.get(url)
             if response.status_code == 200:
                 data = response.json()
                 currency_pair_state.update({
                     "rate": data.get("conversion_rate"),
-                    "last_update": datetime.datetime.fromtimestamp(data.get("time_last_update_unix"))
+                    "last_update": datetime.datetime.fromtimestamp(data.get("time_last_update_unix"), tz=datetime.timezone.utc)
                 })
                 print(f"The latest rate of {data.get('conversion_rate')} for the currency pair {currency_pair_key} is fetched and updated.")
             else:
                 raise Exception(f"Error fetching the exchange rate: HTTP {response.status_code}")
 
         # Convert the amount using the retrieved or stored exchange rate
-        amount = record['device_price_usd']  # Assuming the key is 'amount' as per the function documentation
+        amount = record['device_price_usd']
         rate = currency_pair_state["rate"]
         yield {
             "actual_amount": amount,
@@ -184,6 +188,7 @@ API token.
             "rate_last_updated": currency_pair_state["last_update"],
         }
     ```
+
 1. Next, follow the instructions in
    [Destinations](../../dlt-ecosystem/destinations/duckdb.md) to add credentials for
    your chosen destination. This will ensure that your data is properly routed to its final
@@ -193,8 +198,8 @@ API token.
 
 1. In creating the pipeline, the `converted_amount` can be used in the following ways:
 
-   - Add map function
-   - Transformer function
+  - Add map function
+  - Transformer function
 
    The `dlt` library's `transformer` and `add_map` functions serve distinct purposes in data
    processing.
@@ -208,9 +213,9 @@ API token.
    can be found under [Customize resources](../../general-usage/resource.md#customize-resources) in the
    documentation.
 
-1. Here, we create the pipeline and use the `add_map` functionality:
+1. Here, we create the pipeline and use the `add_yield_map` functionality (since `converted_amount` is a generator function that yields items, we use `add_yield_map` instead of `add_map`):
 
-   ```py
+   ```py notype
    # Create the pipeline
    pipeline = dlt.pipeline(
        pipeline_name="data_enrichment_two",
@@ -219,7 +224,7 @@ API token.
    )
 
    # Run the pipeline with the transformed source
-   load_info = pipeline.run(enriched_data_part_two.add_map(converted_amount))
+   load_info = pipeline.run(enriched_data_part_two.add_yield_map(converted_amount))
 
    print(load_info)
    ```
@@ -229,8 +234,8 @@ API token.
    To do so, you need to add the transformer decorator at the top of the `converted_amount` function.
    For `pipeline.run`, you can use the following code:
 
-   ```py
-   # using fetch_average_price as a transformer function
+   ```py notype
+   # using converted_amount as a transformer function
    load_info = pipeline.run(
        enriched_data_part_two | converted_amount,
        table_name="data_enrichment_part_two"
@@ -264,4 +269,3 @@ API token.
 
    For example, the "pipeline_name" for the above pipeline example is `data_enrichment_two`; you can
    use any custom name instead.
-

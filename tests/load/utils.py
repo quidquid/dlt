@@ -56,7 +56,11 @@ from dlt.common.storages import SchemaStorage, FileStorage, SchemaStorageConfigu
 from dlt.common.schema.utils import new_table, normalize_table_identifiers
 from dlt.common.storages import ParsedLoadJobFileName, LoadStorage, PackageStorage
 from dlt.common.storages.configuration import FilesystemConfiguration
-from dlt.common.storages.load_package import LoadJobInfo, create_load_id
+from dlt.common.storages.load_package import (
+    LoadJobInfo,
+    LoadPackageStateInjectableContext,
+    create_load_id,
+)
 from dlt.common.typing import StrAny
 from dlt.common.utils import uniq_id
 
@@ -65,7 +69,6 @@ from dlt.destinations.impl.filesystem.configuration import FilesystemDestination
 from dlt.destinations.sql_client import SqlClientBase
 from dlt.destinations.job_client_impl import SqlJobClientBase
 
-from tests.load.lance_utils import LanceRestServerConfig, get_lance_namespace_name
 from tests.utils import (
     ACTIVE_DESTINATIONS,
     ACTIVE_TABLE_FORMATS,
@@ -145,6 +148,16 @@ OBJECT_STORE_RS_BUCKETS = [
     if FilesystemDestinationClientConfiguration.parse_protocol(bucket) in ALL_FILESYSTEM_DRIVERS
 ]
 
+# random per test session: a shared lance namespace root accumulates a `__manifest` version per
+# namespace mutation, slowing all namespace operations down with every test run
+_LANCE_ROOT_SUFFIX = uniq_id(4)
+
+
+def get_lance_namespace_name() -> str:
+    # isolate per xdist worker — Lance __manifest writes conflict on S3
+    return f"dlt_lance_root_{get_test_worker_id()}_{_LANCE_ROOT_SUFFIX}"
+
+
 # Add r2 in extra buckets so it's not run for all tests
 R2_BUCKET_CONFIG = dict(
     bucket_url=R2_BUCKET,
@@ -162,6 +175,9 @@ FILE_LAYOUT_CLASSIC = "{schema_name}.{table_name}.{load_id}.{file_id}.{ext}"
 FILE_LAYOUT_MANY_TABLES_ONE_FOLDER = "{table_name}88{load_id}-u-{file_id}.{ext}"
 FILE_LAYOUT_TABLE_IN_MANY_FOLDERS = "{table_name}/{load_id}/{file_id}.{ext}"
 FILE_LAYOUT_TABLE_NOT_FIRST = "{schema_name}/{table_name}/{load_id}/{file_id}.{ext}"
+# {table_name} terminates the layout so dlt appends `.{ext}` and tables share a folder
+FILE_LAYOUT_TABLE_NAME_ONLY = "{table_name}"
+FILE_LAYOUT_TABLE_FOLDER_ONLY = "{table_name}/"
 
 TEST_FILE_LAYOUTS = [
     DEFAULT_FILE_LAYOUT,
@@ -169,6 +185,8 @@ TEST_FILE_LAYOUTS = [
     FILE_LAYOUT_MANY_TABLES_ONE_FOLDER,
     FILE_LAYOUT_TABLE_IN_MANY_FOLDERS,
     FILE_LAYOUT_TABLE_NOT_FIRST,
+    FILE_LAYOUT_TABLE_NAME_ONLY,
+    FILE_LAYOUT_TABLE_FOLDER_ONLY,
 ]
 
 EXTRA_BUCKETS: List[Dict[str, Any]] = []
@@ -474,33 +492,16 @@ def destinations_configs(
         cid_configs_by_cid["athena-iceberg"],
         cid_configs_by_cid["athena-s3-tables"],
     ]
-
     lance_configs = [
-        # directory namespace configs
-        *[
-            DestinationTestConfiguration(
-                destination_type="lance",
-                extra_info=f"dir-{FilesystemConfiguration.parse_protocol(bucket)}",
-                env_vars={
-                    "DESTINATION__STORAGE__BUCKET_URL": bucket,
-                    "DESTINATION__STORAGE__NAMESPACE_NAME": get_lance_namespace_name(),
-                },
-            )
-            for bucket in OBJECT_STORE_RS_BUCKETS
-        ],
-        # REST namespace configs
-        # NOTE: we exclude cloud storage-backed REST namespaces here because `RestAdapter` (which
-        # we use as test REST Namespace server) does not vend credentials — we only include a
-        # local storage-backed REST namespace, which does not need credentials
-        *[
-            DestinationTestConfiguration(
-                destination_type="lance",
-                extra_info=f"rest-{FilesystemConfiguration.parse_protocol(bucket)}",
-                env_vars=LanceRestServerConfig.get_destination_test_configuration_env_vars(),
-            )
-            for bucket in OBJECT_STORE_RS_BUCKETS
-            if bucket == FILE_BUCKET
-        ],
+        DestinationTestConfiguration(
+            destination_type="lance",
+            extra_info=f"dir-{FilesystemConfiguration.parse_protocol(bucket)}",
+            env_vars={
+                "DESTINATION__STORAGE__BUCKET_URL": bucket,
+                "DESTINATION__STORAGE__NAMESPACE_NAME": get_lance_namespace_name(),
+            },
+        )
+        for bucket in OBJECT_STORE_RS_BUCKETS
     ]
 
     # default non staging sql based configs, one per destination
@@ -557,6 +558,14 @@ def destinations_configs(
                 supports_dbt=False,
                 destination_name="sqlalchemy_sqlite",
                 credentials="sqlite:///db.sqlite",
+            ),
+            DestinationTestConfiguration(
+                destination_type="sqlalchemy",
+                supports_merge=True,
+                supports_dbt=False,
+                destination_name="sqlalchemy_duckdb",
+                # naive literals are read in the session timezone, which defaults to the local one
+                credentials="duckdb:///db.duckdb?TimeZone=UTC",
             ),
             # TODO: enable in sql alchemy destination test, 99% of tests work
             # DestinationTestConfiguration(
@@ -1213,26 +1222,34 @@ def expect_load_file(
 
         return job
 
-    if isinstance(client, WithStagingDataset) and client.should_load_data_to_staging_dataset(
-        table_name
+    # jobs may use load package state (e.g. lance fragments) - inject it like the loader does
+    package_storage = PackageStorage(
+        FileStorage(os.path.join(file_storage.storage_path, "normalized_" + load_id)), "normalized"
+    )
+    package_storage.create_package(load_id)
+    with Container().injectable_context(
+        LoadPackageStateInjectableContext(storage=package_storage, load_id=load_id)
     ):
-        # load to staging dataset on merge
-        with client.with_staging_dataset():
+        if isinstance(client, WithStagingDataset) and client.should_load_data_to_staging_dataset(
+            table_name
+        ):
+            # load to staging dataset on merge
+            with client.with_staging_dataset():
+                job = _run_job(file_name)
+        else:
             job = _run_job(file_name)
-    else:
-        job = _run_job(file_name)
-    # execute table chain job
-    if chain_jobs := client.create_table_chain_completed_followup_jobs(
-        [table], [LoadJobInfo("completed_jobs", full_path, 0, 0, 0, job.job_file_info(), "")]  # type: ignore[arg-type]
-    ):
-        assert len(chain_jobs) == 1, "can't execute more than 1 chain job in this test"
-
-        _run_job(chain_jobs[0].new_file_path())
-
-    if isinstance(job, HasFollowupJobs):
-        if chain_jobs := job.create_followup_jobs("completed"):
+        # execute table chain job
+        if chain_jobs := client.create_table_chain_completed_followup_jobs(
+            [table], [LoadJobInfo("completed_jobs", full_path, 0, 0, 0, job.job_file_info(), "")]  # type: ignore[arg-type]
+        ):
             assert len(chain_jobs) == 1, "can't execute more than 1 chain job in this test"
+
             _run_job(chain_jobs[0].new_file_path())
+
+        if isinstance(job, HasFollowupJobs):
+            if chain_jobs := job.create_followup_jobs("completed"):
+                assert len(chain_jobs) == 1, "can't execute more than 1 chain job in this test"
+                _run_job(chain_jobs[0].new_file_path())
 
     return job
 
@@ -1515,8 +1532,7 @@ def count_job_types(p: dlt.Pipeline) -> Dict[str, Dict[str, Any]]:
 
 
 def set_always_refresh_views(config: BaseConfiguration) -> None:
-    # set filesystem views to autorefresh
-    if isinstance(config, FilesystemDestinationClientConfiguration):
+    if "always_refresh_views" in config.get_resolvable_fields():
         config["always_refresh_views"] = True
 
 
@@ -1536,10 +1552,10 @@ def table_update_and_row_for_destination(destination_config: DestinationTestConf
         exclude_types.append("time")
 
     if (
-        destination_config.destination_type in ("synapse", "fabric")
+        destination_config.destination_type == "synapse"
         and destination_config.file_format == "parquet"
     ):
-        # TIME columns are not supported for staged parquet loads into Synapse/Fabric
+        # TIME columns are not supported for staged parquet loads into Synapse
         exclude_types.append("time")
 
     if destination_config.destination_type in (

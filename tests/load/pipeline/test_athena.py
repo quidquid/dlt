@@ -7,11 +7,11 @@ import sqlglot.expressions as sge
 import dlt
 from dlt.common import pendulum
 from dlt.common.configuration.specs.aws_credentials import AwsCredentials
-from dlt.common.destination.exceptions import UnsupportedDataType
+from dlt.common.destination.exceptions import DestinationTransientException, UnsupportedDataType
 from dlt.common.utils import uniq_id
 from dlt.common.libs.sqlglot import resolve_timestamp_cast, build_typed_literal
 
-from dlt.destinations.exceptions import CantExtractTablePrefix, DatabaseTransientException
+from dlt.destinations.exceptions import CantExtractTablePrefix
 from dlt.destinations.adapters import athena_partition, athena_adapter
 from dlt.pipeline.exceptions import PipelineStepFailed
 
@@ -25,6 +25,8 @@ from tests.load.utils import (
     TEST_FILE_LAYOUTS,
     FILE_LAYOUT_MANY_TABLES_ONE_FOLDER,
     FILE_LAYOUT_CLASSIC,
+    FILE_LAYOUT_TABLE_NAME_ONLY,
+    FILE_LAYOUT_TABLE_FOLDER_ONLY,
     FILE_LAYOUT_TABLE_NOT_FIRST,
     destinations_configs,
     DestinationTestConfiguration,
@@ -145,7 +147,6 @@ def test_athena_all_datatypes_and_timestamps(
     # apply the exact columns definitions so we process json and wei types correctly!
     @dlt.resource(table_name="data_types", write_disposition="append", columns=column_schemas)
     def my_resource() -> Iterator[Any]:
-        nonlocal data_types
         yield [data_types] * 10
 
     @dlt.source(max_table_nesting=0)
@@ -312,7 +313,6 @@ def test_athena_blocks_time_column(destination_config: DestinationTestConfigurat
     # apply the exact columns definitions so we process json and wei types correctly!
     @dlt.resource(table_name="data_types", write_disposition="append", columns=column_schemas)
     def my_resource() -> Iterator[Any]:
-        nonlocal data_types
         yield [data_types] * 10
 
     @dlt.source(max_table_nesting=0)
@@ -350,6 +350,8 @@ def test_athena_file_layouts(destination_config: DestinationTestConfiguration, l
     if layout in [
         FILE_LAYOUT_CLASSIC,  # table not in own folder
         FILE_LAYOUT_MANY_TABLES_ONE_FOLDER,  # table not in own folder
+        FILE_LAYOUT_TABLE_NAME_ONLY,  # table not in own folder, dlt appends `.{ext}`
+        FILE_LAYOUT_TABLE_FOLDER_ONLY,  # dlt names the file `.{ext}` and Athena skips hidden files
         FILE_LAYOUT_TABLE_NOT_FIRST,  # table not the first variable
     ]:
         with pytest.raises(CantExtractTablePrefix):
@@ -498,7 +500,7 @@ def test_athena_no_query_result_bucket(
     # NOT with ConfigFieldMissingException
     with pytest.raises(PipelineStepFailed) as pip_ex:
         pipeline.run(items, **destination_config.run_kwargs)
-    assert isinstance(pip_ex.value.__cause__, DatabaseTransientException)
+    assert isinstance(pip_ex.value.__cause__, DestinationTransientException)
     # athena rejects queries when no output location is set and workgroup doesn't manage it
     assert "output location" in str(pip_ex.value.__cause__).lower() or "ResultConfiguration" in str(
         pip_ex.value.__cause__

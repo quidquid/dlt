@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Final, Optional
+from typing import ClassVar, Final, Optional
 
 from dlt.common.typing import TSecretStrValue
 from dlt.common.configuration import configspec
@@ -22,14 +22,16 @@ class RedshiftCredentials(PostgresCredentials):
 
 @configspec
 class RedshiftClientConfiguration(PostgresClientConfiguration):
-    destination_type: Final[str] = dataclasses.field(default="redshift", init=False, repr=False, compare=False)  # type: ignore
+    destination_type: Final[str] = dataclasses.field(default="redshift", init=False, repr=False, compare=False)  # type: ignore[misc]
     credentials: RedshiftCredentials = None
+    DEFAULT_PORT: ClassVar[int] = 5439
 
     staging_iam_role: Optional[str] = None
     has_case_sensitive_identifiers: bool = False
+    additional_copy_options: Optional[list[str]] = None
 
     def fingerprint(self) -> str:
-        """Returns a fingerprint of host part of a connection string"""
+        """Returns a fingerprint of the configured host."""
         if self.credentials and self.credentials.host:
             return digest128(self.credentials.host)
         return ""

@@ -4,13 +4,25 @@ import os
 import platform
 import shutil
 import subprocess
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+import sys
+from pathlib import Path
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import dlt
 from dlt.common.pipeline import get_dlt_pipelines_dir
 from dlt.common.schema import Schema
 from dlt.common.storages.configuration import TSchemaFileFormat
-from dlt.common.time import ensure_pendulum_datetime_non_utc
+from dlt.common.pendulum import ensure_pendulum_dt
+from dlt.common.time import ensure_datetime
 from dlt.common.typing import TAnyDateTime, TFun
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.resolve import resolve_configuration
@@ -32,11 +44,13 @@ from dlt.reflection.script_visitor import PipelineScriptVisitor
 from dlt._workspace.cli.exceptions import CliCommandInnerException
 from dlt._workspace.cli import echo as fmt
 from dlt._workspace.helpers.dashboard.typing import TPipelineListItem
+from dlt._workspace.access import format_access
 from dlt._workspace.typing import (
     ProviderInfo,
     ProviderLocationInfo,
     TLocationScope,
     TSchemaExport,
+    TWorkspaceAccess,
 )
 from dlt._workspace.profile import is_local_profile
 
@@ -91,7 +105,7 @@ def list_local_pipelines(
     sort_by_trace: bool = True,
     additional_pipelines: List[str] = None,
     run_dir: Optional[str] = None,
-) -> Tuple[str, List[TPipelineListItem]]:
+) -> Tuple[str, List[TPipelineListItem], List[str]]:
     """Get the local pipelines directory and the list of pipeline names in it.
 
     Args:
@@ -99,14 +113,20 @@ def list_local_pipelines(
         sort_by_trace: Whether to sort the pipelines by the latest timestamp of trace.
         additional_pipelines: Extra pipeline names to include in the list.
         run_dir: When set, only return pipelines whose initial_cwd matches this path.
+
+    Returns:
+        The pipelines directory, the pipeline list items, and the names discovered on
+        disk before extras are merged in.
     """
     pipelines_dir = pipelines_dir or get_dlt_pipelines_dir()
     storage = FileStorage(pipelines_dir)
 
     try:
-        pipelines = storage.list_folder_dirs(".", to_root=False)
+        local_pipeline_names = storage.list_folder_dirs(".", to_root=False)
     except Exception:
-        pipelines = []
+        local_pipeline_names = []
+
+    pipelines = list(local_pipeline_names)
 
     if additional_pipelines:
         for pipeline in additional_pipelines:
@@ -117,6 +137,11 @@ def list_local_pipelines(
         abs_project_dir = os.path.abspath(run_dir)
         pipelines = [
             p for p in pipelines if _get_pipeline_initial_cwd(pipelines_dir, p) == abs_project_dir
+        ]
+        local_pipeline_names = [
+            p
+            for p in local_pipeline_names
+            if _get_pipeline_initial_cwd(pipelines_dir, p) == abs_project_dir
         ]
 
     # check last trace timestamp and create dict
@@ -129,7 +154,7 @@ def list_local_pipelines(
     if sort_by_trace:
         pipelines_with_timestamps.sort(key=lambda x: x["timestamp"], reverse=True)
 
-    return pipelines_dir, pipelines_with_timestamps
+    return pipelines_dir, pipelines_with_timestamps, local_pipeline_names
 
 
 def date_from_timestamp_with_ago(
@@ -138,7 +163,7 @@ def date_from_timestamp_with_ago(
     """Return a date with ago section"""
     if not timestamp or timestamp == 0:
         return "never"
-    timestamp = ensure_pendulum_datetime_non_utc(timestamp)
+    timestamp = ensure_pendulum_dt(ensure_datetime(timestamp))
     time_formatted = timestamp.format(datetime_format)
     ago = timestamp.diff_for_humans()
     return f"{ago} ({time_formatted})"
@@ -225,7 +250,73 @@ def make_mcp_run_flags(default_port: int = 8000) -> argparse.ArgumentParser:
             % ", ".join(defaults)
         ),
     )
+    flags.add_argument(
+        "--no-default-features",
+        action="store_true",
+        help="Serve only the features named by --features, without the defaults above",
+    )
+    flags.add_argument(
+        "--access",
+        default=None,
+        help=(
+            "Access the caller was granted, as `axis:verb,verb` pairs"
+            " (e.g. data:read,local:read). Tools requiring more are not served."
+            " `axis:` alone grants nothing on that axis. Everything is served when omitted."
+        ),
+    )
     return flags
+
+
+def resolve_features(feature_tokens: Optional[List[str]], defaults: Set[str] = None) -> Set[str]:
+    """Resolve `+name`, `-name`, `name` tokens against defaults into a feature set."""
+    if defaults is None:
+        defaults = set(DEFAULT_MCP_FEATURES)
+    if not feature_tokens:
+        return set(defaults)
+
+    result = set(defaults)
+    for item in feature_tokens:
+        # tokens may be comma-separated: "--features=-secrets,+context"
+        # because argparse treats leading "-" as a flag, use "=" form for removals
+        for token in item.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token.startswith("-"):
+                result.discard(token[1:])
+            elif token.startswith("+"):
+                result.add(token[1:])
+            else:
+                result.add(token)
+    return result
+
+
+def mcp_stdio_args(
+    features: Optional[List[str]] = None,
+    with_defaults: bool = True,
+    access: Optional[TWorkspaceAccess] = None,
+) -> List[str]:
+    """`ai mcp run --stdio` arguments serving `features`, limited to what `access` covers."""
+    args = ["ai", "mcp", "run", "--stdio"]
+    # without `--access` the server grants everything
+    if access is not None:
+        args += ["--access", format_access(access)]
+    # serve `features` alone, not the interactive defaults
+    if not with_defaults:
+        args.append("--no-default-features")
+        resolved = resolve_features(features, set())
+        return args + ["--features", *sorted(resolved)] if resolved else args
+    resolved = resolve_features(features)
+    if resolved != DEFAULT_MCP_FEATURES:
+        args.extend(["--features"] + sorted(resolved))
+    return args
+
+
+def cli_host_command() -> str:
+    """The `dlthub` script next to the running interpreter, or the bare name if there is none."""
+    # always `dlthub`, not the active host: the `dlt` host has no `ai` command
+    script = Path(sys.executable).parent / ("dlthub.exe" if os.name == "nt" else "dlthub")
+    return str(script) if script.is_file() else "dlthub"
 
 
 def add_mcp_arg_parser(subparsers: Any, description: str, help_str: str, default_port: int) -> None:

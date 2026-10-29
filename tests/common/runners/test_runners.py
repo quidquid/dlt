@@ -5,7 +5,7 @@ import pytest
 import sys
 import time
 import multiprocessing
-from concurrent.futures import Executor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from typing import ClassVar, Dict, Iterator, List, Tuple, Type
 
 from dlt.common.runtime import signals
@@ -20,6 +20,7 @@ from dlt.common.configuration.specs.base_configuration import BaseConfiguration
 from dlt.common.exceptions import DltException, SignalReceivedException
 from dlt.common.runners import pool_runner as runner, Runnable, TRunMetrics
 from dlt.common.runners.configuration import PoolRunnerConfiguration, TPoolType
+from dlt.common.managed_thread_pool import ManagedThreadPool
 
 from dlt.common.runtime.init import initialize_runtime
 from tests.common.runners.utils import (
@@ -28,7 +29,7 @@ from tests.common.runners.utils import (
     ALL_METHODS,
     mp_method_auto,
 )
-from tests.utils import init_test_logging
+from tests.utils import init_test_logging, preserve_container
 
 
 @configspec
@@ -151,13 +152,12 @@ def default_args() -> Iterator[None]:
     signals._received_signal = 0
     global _counter
     _counter = 0
-    saved = Container._INSTANCE
-    Container._INSTANCE = None
-    try:
-        yield
-    finally:
-        signals._received_signal = 0
-        Container._INSTANCE = saved
+    with preserve_container():
+        Container._INSTANCE = None
+        try:
+            yield
+        finally:
+            signals._received_signal = 0
 
 
 # test runner functions
@@ -271,6 +271,15 @@ def test_pool_runner_process_methods_configured(method) -> None:
     runs_count = runner.run_pool(ProcessPoolConfiguration(start_method=method), r)
     assert runs_count == 1
     assert [v[0] for v in r.rv] == list(range(4))
+
+
+def test_get_default_start_method_forkserver_normalized_to_fork() -> None:
+    """`forkserver` (the Python 3.14 Linux default) is treated exactly like `fork`."""
+    # forkserver and fork run through the same normalization, so they always agree
+    # (both stay `fork` or both get promoted to `spawn` under an orchestrator / non-main thread)
+    assert runner.get_default_start_method("forkserver") == runner.get_default_start_method("fork")
+    # spawn is never rewritten
+    assert runner.get_default_start_method("spawn") == "spawn"
 
 
 def test_spawn_pool_with_non_importable_main(
@@ -493,6 +502,36 @@ def test_config_section_context_restored_in_worker(
         )
 
 
+@pytest.mark.forked
+@pytest.mark.skipif(
+    "forkserver" not in multiprocessing.get_all_start_methods(),
+    reason="forkserver start method not available on this platform",
+)
+def test_config_section_context_restored_in_forkserver_worker() -> None:
+    """Explicit `forkserver` pools resolve config correctly in workers.
+
+    Marked `forked`
+    so the fork server lives and dies in this test's own process and never hangs the xdist suite.
+    """
+    os.environ["MY_SECTION__TEST_SECTION__TEST_VALUE"] = "sectioned_value"
+    os.environ["TEST_SECTION__TEST_VALUE"] = "non_sectioned_value"
+
+    container = Container()
+    container[ConfigSectionContext] = ConfigSectionContext(
+        pipeline_name=None, sections=("my_section",)
+    )
+    initialize_runtime("dlt", resolve_configuration(RuntimeConfiguration()))
+
+    config = PoolRunnerConfiguration(pool_type="process", workers=4, start_method="forkserver")
+    with runner.create_pool(config) as pool:
+        results = [pool.submit(_worker_resolve_config).result() for _ in range(4)]
+
+    # every worker must resolve the sectioned value via the restored ConfigSectionContext
+    for result_value, result_sections in results:
+        assert result_sections == ("my_section",)
+        assert result_value == "sectioned_value"
+
+
 def test_worker_contexts_thread_to_process() -> None:
     """Test that thread-local contexts are passed to process pools via run_pool.
 
@@ -596,3 +635,38 @@ def test_worker_contexts_thread_to_process_global() -> None:
     assert all(
         val == "global_value" for val in all_values
     ), f"All process workers should see 'global_value', got {all_values}"
+
+
+def test_create_thread_pool(mocker) -> None:
+    assert isinstance(runner.create_thread_pool(1), runner.NullExecutor)
+    assert isinstance(runner.create_thread_pool(0), runner.NullExecutor)
+    with runner.create_thread_pool(4, timeout=2.0) as pool:
+        assert isinstance(pool, runner.TimeoutThreadPoolExecutor)
+        assert pool.timeout == 2.0
+        assert pool.submit(lambda: 1).result() == 1
+
+    # both executors propagate job errors through the future and through map
+    def _raise(_: int = 0) -> None:
+        raise PermissionError("denied")
+
+    for pool in (runner.create_thread_pool(1), runner.create_thread_pool(4)):
+        with pool:
+            with pytest.raises(PermissionError):
+                pool.submit(_raise).result()
+            with pytest.raises(PermissionError):
+                list(pool.map(_raise, range(3)))
+    # platforms without threads run inline
+    mocker.patch.object(runner, "platform_supports_threading", return_value=False)
+    assert isinstance(runner.create_thread_pool(4), runner.NullExecutor)
+
+
+def test_managed_thread_pool_without_threading(mocker) -> None:
+    pool = ManagedThreadPool("test", 1)
+    assert isinstance(pool.thread_pool, ThreadPoolExecutor)
+    pool.stop()
+    # a background pool runs inline only when the platform has no threads
+    mocker.patch("dlt.common.managed_thread_pool.platform_supports_threading", return_value=False)
+    pool = ManagedThreadPool("test", 1)
+    assert isinstance(pool.thread_pool, runner.NullExecutor)
+    assert pool.thread_pool.submit(lambda: 1).result() == 1
+    pool.stop()

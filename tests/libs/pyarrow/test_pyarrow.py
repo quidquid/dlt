@@ -1,3 +1,6 @@
+import base64
+import struct
+import time
 from datetime import timezone, datetime, date, timedelta  # noqa: I251
 from copy import deepcopy
 from typing import List, Any
@@ -25,7 +28,7 @@ from dlt.common.libs.pyarrow import (
     is_arrow_item,
     remove_null_columns_from_schema,
     UnsupportedArrowTypeException,
-    cast_date64_columns_to_timestamp,
+    cast_connectorx_temporal_columns,
 )
 from dlt.common.destination import DestinationCapabilitiesContext
 from tests.cases import table_update_and_row
@@ -133,7 +136,7 @@ def test_py_arrow_to_table_schema_columns_nested_types(supports_nested_types: bo
             assert "x-nested-type" not in column
 
     # Convert back to Arrow schema for roundtrip test
-    roundtrip_schema = columns_to_arrow(columns, caps)
+    roundtrip_schema = columns_to_arrow(columns, caps, "UTC")
 
     # Compare original types with roundtrip types
     for field_name in schema.names:
@@ -192,12 +195,24 @@ def test_nested_type_serialization_deserialization():
     assert str(nested_type) == str(stored_type)
 
     # Complete the roundtrip by converting back to Arrow
-    roundtrip_schema = columns_to_arrow(columns, caps)
+    roundtrip_schema = columns_to_arrow(columns, caps, "UTC")
 
     # Verify the roundtrip
     assert str(schema.field("nested_column").type) == str(
         roundtrip_schema.field("nested_column").type
     )
+
+
+def test_serialize_type_is_deterministic():
+    """The serialized nested type must be byte-stable so the schema version hash does not churn."""
+    nested_type = pa.struct([pa.field("a", pa.int64()), pa.field("b", pa.string())])
+    serialized = serialize_type(nested_type)
+    # advance the wall clock past a second boundary: bytes must not change (no timestamp embedded)
+    time.sleep(1.1)
+    assert serialized == serialize_type(nested_type)
+    # the gzip header MTIME must be 0 (no wall clock embedded), regardless of python version
+    payload = base64.b64decode(serialized[len("arrow-ipc:") :])
+    assert struct.unpack("<I", payload[4:8])[0] == 0
 
 
 def test_py_arrow_to_table_schema_columns_dict_in_struct():
@@ -503,7 +518,7 @@ def test_cast_date64_columns_to_timestamp_rescales_ms_to_us() -> None:
     tbl = pa.table({"ts_like": date64_arr})
 
     # Rescale date64[ms] -> timestamp[us] (naive)
-    out = cast_date64_columns_to_timestamp(tbl)
+    out = cast_connectorx_temporal_columns(tbl)
 
     assert pa.types.is_timestamp(out["ts_like"].type)
     assert out["ts_like"].type == pa.timestamp("us")
@@ -519,7 +534,7 @@ def test_cast_date64_columns_to_timestamp_rescales_ms_to_us() -> None:
 def test_cast_date64_is_noop_when_absent_and_returns_same_object() -> None:
     # Table without date64 columns should be returned unchanged (same object)
     tbl = pa.table({"a": pa.array([1, 2, None]), "b": pa.array(["x", "y", "z"])})
-    out = cast_date64_columns_to_timestamp(tbl)
+    out = cast_connectorx_temporal_columns(tbl)
     assert out is tbl
 
 
@@ -530,7 +545,7 @@ def test_cast_date64_chunked_array_support() -> None:
     date64_chunked = pa.chunked_array([vals1, vals2])
     tbl = pa.table({"ts_like": date64_chunked})
 
-    out = cast_date64_columns_to_timestamp(tbl)
+    out = cast_connectorx_temporal_columns(tbl)
 
     # Should be timestamp[us] chunked array with ms -> us rescaling
     assert pa.types.is_timestamp(out["ts_like"].type)
@@ -542,3 +557,42 @@ def test_cast_date64_chunked_array_support() -> None:
         ]
     )
     assert out["ts_like"].equals(expected)
+
+
+def test_cast_ns_temporal_columns_to_us_truncates_and_keeps_tz() -> None:
+    # connectorx arrow_stream returns timestamp[ns]/time64[ns]; we truncate to us. lossless
+    # because source DBs (e.g. postgres) only have us precision, so ns == us * 1000.
+    us = 1408661138111761  # 2014-08-21 22:45:38.111761
+    time_us = 81938111761  # 22:45:38.111761
+    tbl = pa.table(
+        {
+            "ts": pa.array([0, us * 1000, None], type=pa.timestamp("ns")),
+            "ts_utc": pa.array([0, us * 1000, None], type=pa.timestamp("ns", "UTC")),
+            "t": pa.array([0, time_us * 1000, None], type=pa.time64("ns")),
+        }
+    )
+
+    out = cast_connectorx_temporal_columns(tbl)
+
+    assert out["ts"].type == pa.timestamp("us")
+    # the column's own timezone is preserved
+    assert out["ts_utc"].type == pa.timestamp("us", "UTC")
+    assert out["t"].type == pa.time64("us")
+    # microsecond values are preserved exactly (no precision lost, no spurious sub-us)
+    assert pa.compute.cast(out["ts"], pa.int64()).combine_chunks()[1].as_py() == us
+    assert pa.compute.cast(out["t"], pa.int64()).combine_chunks()[1].as_py() == time_us
+
+
+def test_cast_non_ns_columns_are_noop_and_return_same_object() -> None:
+    # only ns is truncated; us/ms/s temporal columns are left as-is (same object returned)
+    tbl = pa.table(
+        {
+            "ts_us": pa.array([1, 2, None], type=pa.timestamp("us")),
+            "ts_us_utc": pa.array([1, 2, None], type=pa.timestamp("us", "UTC")),
+            "ts_ms": pa.array([1, 2, None], type=pa.timestamp("ms")),
+            "ts_s": pa.array([1, 2, None], type=pa.timestamp("s")),
+            "t_us": pa.array([1, 2, None], type=pa.time64("us")),
+        }
+    )
+    out = cast_connectorx_temporal_columns(tbl)
+    assert out is tbl

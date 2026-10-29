@@ -3,7 +3,6 @@ title: How dlt works
 description: How data load tool (dlt) works
 keywords: [architecture, extract, normalize, load]
 ---
-
 # How dlt works
 
 In a nutshell, dlt automatically turns data from a number of available [sources](../../dlt-ecosystem/verified-sources) (e.g., an API, a PostgreSQL database, or Python data structures) into a live dataset stored in a [destination](../../dlt-ecosystem/destinations) of your choice (e.g., Google BigQuery, a Deltalake on Azure, or by pushing the data back via reverse ETL). You can easily implement your own sources, as long as you yield data in a way that is compatible with dlt, such as JSON objects, Python lists and dictionaries, pandas dataframes, and arrow tables. dlt will be able to automatically compute the schema and move the data to your destination.
@@ -70,7 +69,7 @@ During the loading phase, dlt first runs schema migrations as needed on your des
 
 * dlt is simply a Python package, so it will run [everywhere that Python runs](../../walkthroughs/deploy-a-pipeline) — locally, in notebooks, on orchestrators — you name it.
 * dlt allows you to build and test your data pipelines locally with DuckDB and then switch out the destination for deployment.
-* dlt provides a user-friendly interface for [accessing your data in Python](../../general-usage/dataset-access/dataset), using [the dashboard app](../../hub/ingestion/dashboard.md), and leveraging [integrations](../../general-usage/dataset-access/ibis-backend) with the fabulous Ibis library. All of this even works on data lakes provided by bucket storage providers.
+* dlt provides a user-friendly interface for [accessing your data in Python](../../general-usage/dataset-access/dataset), using [the dashboard app](../../hub/ingestion/dashboard.md), and leveraging [integrations](../../dlt-ecosystem/transformations/python.md#using-ibis) with the fabulous Ibis library. All of this even works on data lakes provided by bucket storage providers.
 * dlt fully manages schema migrations on your destinations. You don’t even need to know how to use SQL to update your schema. It also supports [schema contracts](../../general-usage/schema-contracts) to govern how the schema might evolve.
-* dlt offers numerous options for [monitoring and tracing](../../running-in-production/monitoring) what is happening during your loads.
+* dlt offers numerous options for [monitoring and tracing](../../running-in-production/running.md) what is happening during your loads.
 * dlt supports you when you need to [transform your data](../../dlt-ecosystem/transformations) after the load, whether with dbt or in Python using Arrow tables, Pandas DataFrames, or Polars DataFrames.

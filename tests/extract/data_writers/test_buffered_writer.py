@@ -2,6 +2,7 @@ import os
 import pytest
 import time
 from typing import Iterator, Type
+from unittest.mock import patch
 from uuid import uuid4
 
 from dlt.common.data_writers.exceptions import BufferedDataWriterClosed
@@ -17,6 +18,7 @@ from dlt.common.schema.utils import new_column
 from dlt.common.storages.file_storage import FileStorage
 
 from dlt.common.typing import DictStrAny
+from dlt.common.utils import custom_environ
 
 from tests.common.data_writers.utils import get_writer, ALL_OBJECT_WRITERS
 
@@ -129,7 +131,7 @@ def test_rotation_with_buffer_on_schema_change(disable_compression: bool) -> Non
     # the last file must contain text value of the column3
     with FileStorage.open_zipsafe_ro(writer.closed_files[-1].file_path, "r", encoding="utf-8") as f:
         content = f.readlines()
-    assert "(col3_value" in content[-1]
+    assert "('col3_value'" in content[-1]
     # check metrics
     assert writer.closed_files[0].items_count == 11
     assert writer.closed_files[1].items_count == 22
@@ -341,19 +343,22 @@ def test_gather_metrics(disable_compression: bool, writer_type: Type[DataWriter]
     now = time.time()
     c1 = new_column("col1", "bigint")
     t1 = {"col1": c1}
+    clock = [0.0]
     with get_writer(
         writer_type, disable_compression=disable_compression, buffer_max_items=2, file_max_items=2
     ) as writer:
-        time.sleep(0.55)
+        assert writer._created >= now
+        writer._clock = lambda: clock[0]  # type: ignore[assignment]
+        writer._created = clock[0]
+        clock[0] += 0.55
         count = writer.write_data_item([{"col1": 182812}, {"col1": -1}], t1)
         assert count == 2
         # file rotated
         assert len(writer.closed_files) == 1
         metrics = writer.closed_files[0]
         assert metrics.items_count == 2
-        assert metrics.last_modified - metrics.created >= 0.55
-        assert metrics.created >= now
-        time.sleep(0.35)
+        assert metrics.last_modified - metrics.created == pytest.approx(0.55)
+        clock[0] += 0.35
         count = writer.write_data_item([{"col1": 182812}, {"col1": -1}, {"col1": 182811}], t1)
         assert count == 3
         # file rotated
@@ -361,7 +366,7 @@ def test_gather_metrics(disable_compression: bool, writer_type: Type[DataWriter]
         metrics_2 = writer.closed_files[1]
         assert metrics_2.items_count == 3
         assert metrics_2.created >= metrics.last_modified
-        assert metrics_2.last_modified - metrics_2.created >= 0.35
+        assert metrics_2.last_modified - metrics_2.created == pytest.approx(0.35)
 
     assert len(writer.closed_files) == 2
     if not disable_compression and writer.writer_spec.supports_compression:
@@ -466,3 +471,27 @@ def test_rotation_on_destination_caps_recommended_file_size(
         assert all(closed_file.file_path.endswith(".gz") for closed_file in writer.closed_files)
     else:
         assert not any(closed_file.file_path.endswith(".gz") for closed_file in writer.closed_files)
+
+
+def test_write_header_failure_releases_file() -> None:
+    """When write_header raises, buffered writer recovers via writer.close() without leaking the file handle."""
+    c1 = new_column("col1", "text")
+    with patch.object(JsonlWriter, "write_header", side_effect=ValueError("header failed")):
+        writer = get_writer(JsonlWriter, disable_compression=True)
+        with pytest.raises(ValueError, match="header failed"):
+            with writer:
+                writer.write_data_item([{"col1": "a"}], {"col1": c1})
+    # file handle released so the file can be deleted on Windows
+    assert writer._file is None
+    assert writer._writer is None
+    os.remove(writer.closed_files[-1].file_path)
+
+
+def test_encoding_ignored_by_non_csv_formats() -> None:
+    c1 = new_column("col1", "text")
+    with custom_environ({"DATA_WRITER__ENCODING": "latin-1"}):
+        with get_writer(InsertValuesWriter, disable_compression=True) as writer:
+            writer.write_data_item([{"col1": "æøå"}], {"col1": c1})
+    # insert files are read back as utf-8 by destinations so csv encoding setting must not apply
+    with open(writer.closed_files[0].file_path, "r", encoding="utf-8") as f:
+        assert "æøå" in f.read()

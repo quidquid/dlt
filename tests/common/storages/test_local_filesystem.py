@@ -9,6 +9,7 @@ from dlt.common.configuration.exceptions import ConfigurationValueError
 from dlt.common.configuration.resolve import resolve_configuration
 from dlt.common.storages import fsspec_from_config, FilesystemConfiguration
 from dlt.common.storages.fsspec_filesystem import FileItemDict, glob_files
+from dlt.common.utils import digest128
 
 from tests.common.storages.utils import assert_sample_files, TEST_SAMPLE_FILES
 from tests.utils import skipifnotwindows, skipifwindows, get_test_storage_root
@@ -53,7 +54,7 @@ def test_local_path_win_configuration(bucket_url: str, file_url: str) -> None:
     last_err: Exception = None
     for attempt in range(3 if is_unc else 1):
         try:
-            assert FilesystemConfiguration.make_file_url(bucket_url) == file_url
+            assert FilesystemConfiguration.make_file_url(bucket_url).lower() == file_url.lower()
             break
         except OSError as e:
             last_err = e
@@ -64,10 +65,12 @@ def test_local_path_win_configuration(bucket_url: str, file_url: str) -> None:
 
     c = resolve_configuration(FilesystemConfiguration(bucket_url))
     assert c.protocol == "file"
-    assert c.bucket_url == file_url
+    # bucket_url is normalized via make_file_url, so it carries the same canonicalized case
+    assert c.bucket_url.lower() == file_url.lower()
     assert FilesystemConfiguration.make_local_path(c.bucket_url) == str(
         pathlib.Path(bucket_url).resolve()
     )
+    assert c.fingerprint() == FilesystemConfiguration(bucket_url).fingerprint()
 
 
 @skipifnotwindows
@@ -89,6 +92,7 @@ def test_local_user_win_path_configuration(bucket_url: str) -> None:
     assert FilesystemConfiguration.make_local_path(c.bucket_url) == str(
         pathlib.Path(bucket_url).expanduser()
     )
+    assert c.fingerprint() == FilesystemConfiguration(bucket_url).fingerprint()
 
 
 @skipifnotwindows
@@ -126,6 +130,9 @@ def test_file_posix_configuration(bucket_url: str, file_url: str) -> None:
     assert FilesystemConfiguration.make_local_path(c.bucket_url) == str(
         pathlib.Path(bucket_url).resolve()
     )
+    # normalizing a local path into a file:// url must not change its fingerprint
+    assert c.fingerprint() == FilesystemConfiguration(bucket_url).fingerprint()
+    assert c.fingerprint() == digest128("file://")
 
 
 @skipifwindows
@@ -144,6 +151,8 @@ def test_local_user_posix_path_configuration(bucket_url: str) -> None:
     assert FilesystemConfiguration.make_local_path(c.bucket_url) == str(
         pathlib.Path(bucket_url).expanduser()
     )
+    assert c.fingerprint() == FilesystemConfiguration(bucket_url).fingerprint()
+    assert c.fingerprint() == digest128("file://")
 
 
 @pytest.mark.parametrize(
@@ -170,6 +179,7 @@ def test_file_host_configuration(bucket_url: str, local_path: str) -> None:
     c = resolve_configuration(FilesystemConfiguration(bucket_url))
     assert c.protocol == "file"
     assert c.bucket_url == bucket_url
+    assert c.fingerprint() == FilesystemConfiguration(bucket_url).fingerprint()
 
 
 @pytest.mark.parametrize(
@@ -205,6 +215,7 @@ def test_file_filesystem_configuration(
         assert FilesystemConfiguration.make_local_path(c.bucket_url) == str(
             pathlib.Path(local_path).resolve()
         )
+        assert c.fingerprint() == FilesystemConfiguration(bucket_url).fingerprint()
 
 
 @pytest.mark.parametrize(

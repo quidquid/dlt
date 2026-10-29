@@ -3,9 +3,7 @@
 const fs = require("node:fs");
 require("dotenv").config();
 
-// const lightCodeTheme = require('prism-react-renderer/themes/dracula');
-const lightCodeTheme = require("prism-react-renderer/themes/github");
-const darkCodeTheme = require("prism-react-renderer/themes/dracula");
+const codeTheme = require("prism-react-renderer/themes/synthwave84");
 
 // create versions config
 const versions = {
@@ -99,6 +97,10 @@ const config = {
           exclude: [
             // '**/_*.{js,jsx,ts,tsx,md,mdx}',
             // '**/_*/**',
+            // the defaults above would also drop the generated `__init__.md` API reference
+            // pages, so only the hand-written partials are excluded; they can still be imported
+            "_*.{md,mdx}",
+            "dlt-ecosystem/**/_*.{md,mdx}",
             "**/*.test.{js,jsx,ts,tsx}",
             "**/__tests__/**",
           ],
@@ -113,17 +115,25 @@ const config = {
         theme: {
           customCss: require.resolve("./src/css/custom.css"),
         },
+        sitemap: {
+          // the search page is not content
+          ignorePatterns: ["/docs/search"],
+        },
       },
     ],
   ],
 
   plugins: [
+    // re-runs the python docs preprocessor when `website/docs` sources change
+    require.resolve("./plugins/preprocess-docs"),
+    // serves the last built search index during `docusaurus start`
+    require.resolve("./plugins/pagefind-dev"),
     [
       require.resolve("./plugins/llms-txt"),
       {
         siteTitle: "dlt - data load tool",
         siteDescription:
-          "dlt is an open-source Python library that loads data from various sources into well-structured datasets. Built for LLMs with 8000+ source connectors.",
+          "dlt is an open-source Python library that loads data from various sources into well-structured datasets. Built for LLMs with 11,000+ source connectors.",
         excludeFromMd: ["api_reference/"],
         excludeFromIndex: ["devel/"],
         groupDepth: 2,
@@ -156,15 +166,15 @@ const config = {
           },
           {
             type: "docSidebar",
-            sidebarId: "docsSidebar",
-            position: "left",
-            label: "dlt",
-          },
-          {
-            type: "docSidebar",
             sidebarId: "hubSidebar",
             position: "left",
             label: "dltHub",
+          },
+          {
+            type: "docSidebar",
+            sidebarId: "docsSidebar",
+            position: "left",
+            label: "dlt",
           },
           {
             type: "docSidebar",
@@ -178,7 +188,17 @@ const config = {
             position: "left",
             label: "Education",
           },
-          { to: "/release-highlights", label: "What's new?", position: "left" },
+          {
+            type: "dropdown",
+            label: "What's new?",
+            position: "left",
+            items: [
+              { to: "/release-highlights", label: "dlt" },
+              // devel-scoped until this page reaches master; retarget to
+              // /hub/release-highlights once it is in the released version
+              { to: "/devel/hub/release-highlights", label: "dltHub" },
+            ],
+          },
           { to: "https://dlthub.com/blog", label: "Blog", position: "right" },
           {
             href: "https://dlthub.com/community",
@@ -235,8 +255,8 @@ const config = {
             title: "Workspace",
             items: [
               {
-                label: "Scaffoldings",
-                href: "https://dlthub.com/workspace",
+                label: "Context",
+                href: "https://dlthub.com/context",
                 className: "footer-link",
               },
             ],
@@ -245,8 +265,8 @@ const config = {
         copyright: `Copyright © ${new Date().getFullYear()} dltHub, Inc.`,
       },
       prism: {
-        theme: lightCodeTheme,
-        darkTheme: darkCodeTheme,
+        theme: codeTheme,
+        darkTheme: codeTheme,
         additionalLanguages: ["powershell", "bash", "python", "toml", "yaml", "log"],
       },
       metadata: [
@@ -256,18 +276,7 @@ const config = {
             "data loading, elt, etl, extract, load, transform, python, data engineering, data warehouse, data lake",
         },
       ],
-      algolia: {
-        // The application ID provided by Algolia
-        appId: "FUTSIDO7MI",
-
-        // Public API key: it is safe to commit it
-        apiKey: "94b8ae9b02673db8232fc6fe712bc5a0",
-
-        indexName: "dlthub",
-
-        // Optional: see doc section below
-        contextualSearch: false,
-      },
+      // search: Pagefind, see src/theme/SearchBar and pagefind.yml
       colorMode: {
         defaultMode: "dark",
         disableSwitch: false,

@@ -3,7 +3,6 @@ title: "Destination: Delta"
 description: Delta destination
 keywords: [delta, delta lake]
 ---
-
 # Delta
 
 :::note
@@ -12,18 +11,15 @@ Use of the dltHub platform and toolkits is subject to a commercial dltHub Licens
 
 The Delta destination is based on the [filesystem destination](../../dlt-ecosystem/destinations/filesystem.md) in dlt. All configuration options from the filesystem destination can be configured as well.
 
-:::warning
-Under the hood, dltHub uses the [deltalake library](https://pypi.org/project/deltalake/) to write Delta tables. Beware that when loading a large amount of data for one table, the underlying Rust implementation will consume a lot of memory. This is a known issue, and the maintainers are actively working on a solution. You can track the progress [here](https://github.com/delta-io/delta-rs/pull/2289). Until the issue is resolved, you can mitigate the memory consumption by doing multiple smaller incremental pipeline runs.
-:::
-
 ## Setup
 
 Make sure you have installed the necessary dependencies:
+
 ```sh
 pip install deltalake
 ```
 
-If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-start@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Delta pipeline:
+If you don't have a dltHub workspace yet, scaffold one with `uvx dlthub-init@latest` (see the [installation guide](../getting-started/installation.md)). Then, from inside the workspace, add a Delta pipeline:
 
 ```sh
 dlthub pipeline init sql_database delta
@@ -56,6 +52,7 @@ The credentials can be defined in the `secrets.toml`:
 aws_access_key_id="Please set me up!"
 aws_secret_access_key="Please set me up!"
 ```
+
 </TabItem>
 
 <TabItem value="azure">
@@ -66,6 +63,7 @@ aws_secret_access_key="Please set me up!"
 azure_storage_account_name="Please set me up!"
 azure_storage_account_key="Please set me up!"
 ```
+
 </TabItem>
 
 <TabItem value="gcp">
@@ -81,6 +79,7 @@ client_email="Please set me up!"
 private_key="Please set me up!"
 project_id="Please set me up!"
 ```
+
 </TabItem>
 
 <TabItem value="sftp">
@@ -95,10 +94,10 @@ sftp_username = "foo"
 sftp_key_filename = "/path/to/id_rsa"     # Replace with the path to your private key file
 sftp_key_passphrase = "your_passphrase"   # Optional: passphrase for your private key
 ```
+
 </TabItem>
 
 </Tabs>
-
 
 The Delta destination can also be defined in Python as follows:
 
@@ -109,6 +108,7 @@ pipeline = dlt.pipeline("loads_delta", destination="delta")
 ## Write dispositions
 
 The Delta destination handles the write dispositions as follows:
+
 - `append` - files belonging to such tables are added to the dataset folder.
 - `replace` - all files that belong to such tables are deleted from the dataset folder, and then the current set of files is added.
 - `merge` - can be used with the `upsert` [merge strategy](../../general-usage/merge-loading.md#upsert-strategy) and the `insert-only` [merge strategy](../../general-usage/merge-loading.md#insert-only-strategy).
@@ -159,6 +159,7 @@ Partition evolution (changing partition columns after a table has been created) 
 :::
 
 ## Table access helper functions
+
 You can use the `get_delta_tables` helper functions to access the native [DeltaTable](https://delta-io.github.io/delta-rs/api/delta_table/) objects.
 
 ```py
@@ -177,6 +178,7 @@ delta_tables["another_delta_table"].optimize.z_order(["col_a", "col_b"])
 ```
 
 ## Table format
+
 The Delta destination automatically assigns the `delta` table format to all resources that it will load. You can still fall back to storing files by setting `table_format` to native on the resource level:
 
   ```py
@@ -190,6 +192,7 @@ The Delta destination automatically assigns the `delta` table format to all reso
   ```
 
 ## Storage options and configuration
+
 You can pass storage options and configuration by configuring both `destination.filesystem.deltalake_storage_options` and
 `destination.filesystem.deltalake_configuration`:
 

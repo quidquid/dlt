@@ -3,30 +3,25 @@ title: Data security and encryption
 description: Transforming the data for encryption in transit, client-side encryption, and encryption at rest.
 keywords: [transform, data security, encryption]
 ---
-
 # Data security and encryption
 
 The modern data landscape requires robust security measures to protect sensitive information throughout its lifecycle. Organizations must implement comprehensive encryption strategies to safeguard data against increasingly sophisticated threats
 
-### Encryption throughout the lifecycle
+## Encryption throughout the lifecycle
 
 Data is vulnerable both while moving between systems (in transit) and when stored at rest. dlt addresses both needs:
 
 - **Data in transit**:
 
-    
     During transfers, data can be intercepted or tampered with. Employing secure protocols (e.g., SSL/TLS) or encrypted connection strings prevents unauthorized access and ensures confidentiality.
-    
+
 - **Client-side encryption**:
 
-    
     Encrypting data on the client side before transmission adds an extra layer of security. By using libraries like AWS Encryption SDK, Google Tink, or Azure Key Vault, organizations can ensure that data is encrypted before it leaves the source, maintaining control over encryption keys and safeguarding sensitive information throughout its journey.
-    
+
 - **Data at rest / Server-side encryption**:
 
-    
     Even if a storage system is compromised, encryption at rest prevents unauthorized access. dlt can leverage disk encryption (e.g., BitLocker, FileVault, dm-crypt/LUKS) or the destination’s server-side encryption to keep data safe on the local machine and in the cloud.
-    
 
 This layered approach ensures comprehensive protection, covering every stage of data’s journey from extraction to storage.
 
@@ -45,7 +40,6 @@ Client-side encryption empowers you to encrypt data before it ever leaves your e
 - Tink by Google
 - Azure Key Vault & Blob Client-Side Encryption
 - OpenSSL
-
 
 ## Encryption in transit and server-side encryption
 
@@ -181,25 +175,3 @@ In this code:
 - The AWS Encryption SDK is used to encrypt the `security_key` field before loading the data with dlt.
 - You can adapt this pattern to encrypt other sensitive fields or integrate different encryption libraries.
 - Various encryption methods can be employed for client-side encryption.
-
-## Security best practices
-
-**1. Combine client-side and server-side encryption**
-
-For maximum security, encrypt data on the client side and also enable server-side encryption at the destination. This ensures data remains secure, even if one layer of security fails or is misconfigured.
-
-**2. Key management and rotation**
-
-Use a dedicated Key Management Service (KMS) such as AWS KMS, Google Cloud KMS, or Azure Key Vault to store and manage your encryption keys. Rotate keys regularly and enforce strict access controls.
-
-**3. Secure your infrastructure**
-
-Encrypt the local disk or partition where dlt extracts and processes data to ensure the data at rest on your system is protected (e.g., BitLocker, FileVault, dm-crypt/LUKS).
-
-**4. Monitor and audit**
-
-Implement monitoring for unusual access patterns, and maintain detailed logs for auditing. Services like AWS CloudTrail or Azure Monitor can provide insights into who accessed your keys and when.
-
-**5. Validate and test**
-
-Regularly test your encryption and decryption workflows in a staging or QA environment. Confirm that you can restore data from backups and that your encryption processes don’t introduce bottlenecks or errors.

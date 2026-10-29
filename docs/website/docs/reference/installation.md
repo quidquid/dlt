@@ -1,14 +1,14 @@
 ---
-title: Installation
+title: Install dlt with pip, uv or Conda
+sidebar_label: Installation
 description: How to install dlt
 keywords: [installation, environment, pip install]
 ---
-
 # Installation
 
 ## Setting up your environment
 
-### 1. Make sure you are using **Python 3.9-3.13** and have `pip` installed
+### 1. Make sure you are using **Python 3.10-3.14** and have `pip` installed
 
 ```sh
 python --version
@@ -117,11 +117,13 @@ uv pip install -U dlt
 Here are some additional installation examples:
 
 To install dlt with DuckDB support:
+
 ```sh
 uv pip install "dlt[duckdb]"
 ```
 
 To install a specific version of dlt (for example, versions before 0.5.0):
+
 ```sh
 uv pip install "dlt<0.5.0"
 ```
@@ -140,7 +142,7 @@ To install dlt using `conda`:
 conda install -c conda-forge dlt
 ```
 
-### 4. Done!
+### 4. Done
 
 You are now ready to build your first pipeline with `dlt`. Check out these tutorials to get started:
 
@@ -149,4 +151,3 @@ You are now ready to build your first pipeline with `dlt`. Check out these tutor
 - [Load data from a cloud storage or a file system](../tutorial/filesystem)
 
 Or read a more detailed tutorial on how to build a [custom data pipeline with dlt](../tutorial/load-data-from-an-api.md).
-

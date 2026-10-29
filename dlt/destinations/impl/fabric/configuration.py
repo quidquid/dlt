@@ -2,9 +2,11 @@
 
 from typing import Optional, Final, ClassVar, Dict, Any, List
 from dlt.common.configuration import configspec
+from dlt.common.configuration.exceptions import ConfigurationValueError
 from dlt.common.configuration.specs import AzureServicePrincipalCredentials
 from dlt.common.destination.client import DestinationClientDwhWithStagingConfiguration
 from dlt.common.exceptions import MissingDependencyException
+from dlt.common.utils import digest128
 from dlt import version
 
 _AZURE_STORAGE_EXTRA = f"{version.DLT_PKG_NAME}[az]"
@@ -164,6 +166,21 @@ class FabricClientConfiguration(DestinationClientDwhWithStagingConfiguration):
 
     Both have UTF-8 encoding. LongAsMax=yes is automatically configured.
     """
+
+    def data_location(self) -> str:
+        """Returns host:port."""
+        if not self.credentials or not self.credentials.host:
+            self._no_data_location("the configuration has no host")
+        port = self.credentials.port or 1433
+        return f"{self.credentials.host}:{port}"
+
+    def fingerprint(self) -> str:
+        """Returns a fingerprint of the physical Fabric location."""
+        # a fingerprint can say "cannot compute", where a location raises instead
+        try:
+            return digest128(self.data_location())
+        except ConfigurationValueError:
+            return ""
 
 
 __all__ = ["FabricCredentials", "FabricClientConfiguration"]

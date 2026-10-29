@@ -8,6 +8,7 @@ from typing import (
     Iterable,
     Iterator,
     Generator,
+    List,
     Type,
     Union,
     Any,
@@ -16,6 +17,8 @@ from typing import (
 )
 
 from dlt.common import logger
+from dlt.common.exceptions import TypeErrorWithKnownTypes
+from dlt.common.metrics import TDataLocation
 from dlt.common.configuration.inject import get_fun_spec, with_config
 from dlt.common.configuration.resolve import inject_section
 from dlt.common.configuration.specs import BaseConfiguration, known_sections
@@ -74,6 +77,7 @@ from dlt.extract.pipe import Pipe
 from dlt.extract.hints import DltResourceHints, HintsMeta, TResourceHints
 from dlt.extract.incremental import Incremental, IncrementalResourceWrapper
 from dlt.extract.exceptions import (
+    DataLocationKindRequired,
     InvalidTransformerDataTypeGeneratorFunctionRequired,
     InvalidParentResourceDataType,
     InvalidParentResourceIsAFunction,
@@ -141,6 +145,7 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
         self.source_name = None
         self._parent: DltResource = None
         self._custom_metrics: Dict[str, Any] = {}
+        self._inputs: List[TDataLocation] = []
         super().__init__(hints)
         self._update_wrapper()
 
@@ -226,6 +231,45 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
     def custom_metrics(self) -> Dict[str, Any]:
         """Customizable resource metrics"""
         return self._custom_metrics
+
+    @property
+    def inputs(self) -> List[TDataLocation]:
+        """Data locations this resource read from, recorded during extraction."""
+        return self._inputs
+
+    def add_input(self, location: TDataLocation, replace: bool = False) -> Self:
+        """Records a data location this resource reads from, to be emitted in the pipeline trace.
+
+        Call on the resource instance when it is created, or from inside a running resource via
+        `dlt.current.resource()` when the location is only known once config is resolved. One entry
+        per location, listing the tables, endpoints or files touched inside it - not one entry per
+        table. `kind` defaults to the name of the source this resource belongs to, and must be
+        passed explicitly by a resource that has no source yet.
+
+        Args:
+            location (TDataLocation): Location that was read, or a `kind`-specific subclass of it.
+            replace (bool): Drops the locations recorded so far and records `location` as the only
+                one.
+
+        Returns:
+            DltResource: returns self
+
+        Raises:
+            TypeErrorWithKnownTypes: If `location` is not a mapping.
+            DataLocationKindRequired: If `kind` is absent and there is no source to default it from.
+        """
+        if not isinstance(location, dict):
+            raise TypeErrorWithKnownTypes("location", location, ["TDataLocation"])
+        # a fact that could not be established is absent from the row, not null
+        described: DictStrAny = dict(without_none(location))
+        if not described.get("kind"):
+            if not self.source_name:
+                raise DataLocationKindRequired(self.name)
+            described["kind"] = self.source_name
+        if replace:
+            self._inputs.clear()
+        self._inputs.append(cast(TDataLocation, described))
+        return self
 
     @property
     def name(self) -> str:
@@ -470,9 +514,6 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
             self._pipe.insert_step(item_transform, insert_at)
         return self
 
-    def _remove_incremental_step(self) -> None:
-        self._pipe.remove_by_type(Incremental, IncrementalResourceWrapper)
-
     def set_incremental(
         self, new_incremental: Union[Incremental[Any], IncrementalResourceWrapper]
     ) -> Optional[Union[Incremental[Any], IncrementalResourceWrapper]]:
@@ -480,7 +521,6 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
 
         Args:
             new_incremental: The Incremental instance/hint to set or replace
-            from_hints: If the incremental is set from hints. Defaults to False.
         """
         if new_incremental is Incremental.EMPTY:
             new_incremental = None
@@ -489,26 +529,17 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
             if resource_primary_key := self._hints.get("primary_key"):
                 new_incremental.set_deduplication_key(resource_primary_key, from_hints=True)
         incremental = self.incremental
-        if incremental is not None:
-            # if isinstance(new_incremental, Mapping):
-            #     new_incremental = Incremental.ensure_instance(new_incremental)
-
-            if isinstance(new_incremental, IncrementalResourceWrapper):
-                # Completely replace the wrapper
-                self._remove_incremental_step()
-                self.add_step(new_incremental)
-            elif isinstance(incremental, IncrementalResourceWrapper):
-                incremental.set_incremental(new_incremental, from_hints=True)
-            else:
-                self._remove_incremental_step()
-                # re-add the step
-                incremental = None
-        if incremental is None:
-            # if there's no wrapper add incremental as a transform
+        if isinstance(incremental, IncrementalResourceWrapper) and not isinstance(
+            new_incremental, IncrementalResourceWrapper
+        ):
+            incremental.set_incremental(new_incremental, from_hints=True)
+        else:
+            # replace the step in place so steps inserted after it keep their position
+            step_no = self._pipe.remove_by_type(Incremental, IncrementalResourceWrapper)
             if new_incremental:
                 if not isinstance(new_incremental, IncrementalResourceWrapper):
                     new_incremental = Incremental.ensure_instance(new_incremental)
-                self.add_step(new_incremental)
+                self.add_step(new_incremental, insert_at=step_no if step_no >= 0 else None)
         return new_incremental
 
     def _set_hints(
@@ -688,15 +719,14 @@ class DltResource(Iterable[TDataItem], DltResourceHints):
     def _eject_config(self) -> bool:
         """Unwraps the pipe generator step from config injection and incremental wrappers by restoring the original step.
 
-        Removes the step with incremental wrapper. Should be used before a subsequent _inject_config is called on the
-        same pipe to successfully wrap it with new incremental and config injection.
+        Should be used before a subsequent _inject_config is called on the same pipe to successfully wrap it with
+        new incremental and config injection. The incremental step stays in the pipe and is replaced in place.
         Note that resources with bound arguments cannot be ejected.
 
         """
         if not self._pipe.is_empty and not self._args_bound:
             orig_gen = getattr(self._pipe.gen, "__GEN__", None)
             if orig_gen:
-                self._remove_incremental_step()
                 self._pipe.replace_gen(orig_gen)
                 return True
         return False

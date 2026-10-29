@@ -1,7 +1,9 @@
-import dlt, os, pytest
+import dlt, pytest
 import contextlib
-from typing import Any, Callable, ClassVar, Dict, Iterator, Literal, Union, Optional, Type
+from typing import Any, Callable, ClassVar, Dict, Iterator, Literal, Union, Optional, Type, cast
 
+from dlt.common import Decimal
+from dlt.common.destination.typing import PreparedTableSchema
 from dlt.common.schema.typing import (
     TColumnSchema,
     TSchemaContract,
@@ -9,8 +11,11 @@ from dlt.common.schema.typing import (
     TSchemaEvolutionMode,
 )
 from dlt.common.utils import uniq_id
+from dlt.common.schema import Schema
+from dlt.common.schema.utils import new_table
 from dlt.common.schema.exceptions import DataValidationError
 from dlt.common.typing import TDataItems
+from dlt.destinations import snowflake
 from dlt.extract.hints import make_hints
 
 from dlt.extract import DltResource
@@ -1119,6 +1124,75 @@ def test_pydantic_model_evolve_on_existing_table(
         assert "email" not in table["columns"]
 
 
+def test_replace_contract_discard_all_rows_truncates() -> None:
+    pipeline = get_pipeline()
+
+    @dlt.resource(
+        name="items",
+        write_disposition="replace",
+        columns={"id": {"data_type": "bigint"}},
+        schema_contract={"columns": "discard_row"},
+    )
+    def items(with_new_column: bool) -> Any:
+        # with_new_column adds a NEW column `extra` to every row so discard_row drops them all
+        if with_new_column:
+            yield from [{"id": i, "extra": i} for i in range(5)]
+        else:
+            yield from [{"id": i} for i in range(5)]
+
+    # run 1: rows survive (no new column) - table is populated
+    info = pipeline.run(items(False))
+    assert_load_info(info)
+    assert load_table_counts(pipeline)["items"] == 5
+
+    # run 2: every row is dropped by the contract -> empty job -> replace truncates the table
+    info = pipeline.run(items(True))
+    assert_load_info(info)
+    assert pipeline.last_trace.last_normalize_info.row_counts["items"] == 0
+    assert load_table_counts(pipeline).get("items", 0) == 0
+    # the new column was blocked by the contract
+    assert "extra" not in pipeline.default_schema.get_table("items")["columns"]
+
+
+def test_upsert_contract_discard_all_rows_never_seen_table_not_verified() -> None:
+    """A never-seen `upsert` table whose rows are all dropped by a contract must not be materialized
+    or verified. Before the fix the normalizer wrote an empty job for it, which both flagged the
+    table seen-data that triggered various schema checks that were failing."""
+    pipeline = get_pipeline()
+
+    # establish `items` in the schema (so `evolve-columns-once` does not apply) WITHOUT data:
+    # complete `val`, hint-only (untyped) primary key `id`, upsert, columns: discard_row
+    schema = Schema("contracts")
+    table = new_table(
+        "items", write_disposition="merge", schema_contract={"columns": "discard_row"}
+    )
+    table["x-merge-strategy"] = "upsert"  # type: ignore[typeddict-unknown-key]
+    table["columns"] = {
+        "val": {"name": "val", "data_type": "text"},
+        "id": {"name": "id", "primary_key": True, "nullable": False},
+    }
+    schema.update_table(table, normalize_identifiers=False)
+
+    @dlt.resource(name="items")
+    def items() -> Any:
+        # every row carries a NEW column `extra` so discard_row drops them all
+        yield [{"id": i, "val": "x", "extra": i} for i in range(3)]
+
+    # before the fix this raised `No primary key defined` during verify_schema at the load step
+    info = pipeline.run(items(), schema=schema)
+    assert_load_info(info)
+    # the table that never received data is not created at the destination
+    with pipeline.sql_client() as client:
+        existing = [
+            row[0]
+            for row in client.execute_sql(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema ="
+                " current_schema()"
+            )
+        ]
+    assert "items" not in existing
+
+
 @pytest.mark.parametrize("contract_setting", ["freeze", "discard_value", "discard_row"])
 def test_pydantic_model_forbid_extra_evolve_on_existing_table(
     contract_setting: TSchemaEvolutionMode,
@@ -1211,6 +1285,54 @@ def test_arrow_data_new_column_blocked_by_contract(contract_setting: TSchemaEvol
         assert (
             "email" not in table["columns"]
         ), f"arrow-data column 'email' should be blocked by {contract_setting}"
+
+
+@pytest.mark.parametrize("item_format", ["pandas", "arrow-table", "arrow-batch"])
+@pytest.mark.parametrize("data_type_contract", ["evolve", "discard_value"])
+def test_arrow_hint_changes_data_type(
+    item_format: TestDataItemFormat, data_type_contract: TSchemaEvolutionMode
+) -> None:
+    """Text hint over decimal arrow data (ie. sql_database reflection) leaves no stale scale."""
+    pipeline = get_pipeline()
+    contract: TSchemaContract = {"data_type": data_type_contract}
+    decimals = data_to_item_format(item_format, [{"id": 1, "value": Decimal("10.25")}])
+    texts = data_to_item_format(item_format, [{"id": 2, "value": "some text"}])
+    text_hint: TColumnSchema = {"data_type": "text", "precision": 50}
+    decimal_hint: TColumnSchema = {"data_type": "decimal", "precision": 10, "scale": 2}
+
+    # new table: contract does not apply, text hint replaces arrow decimal type
+    pipeline.extract(
+        dlt.resource(
+            decimals, name=NEW_ITEMS_TABLE, columns={"value": text_hint}, schema_contract=contract
+        )
+    )
+    # existing decimal column: text hint is accepted or discarded by the contract
+    pipeline.extract(
+        dlt.resource(
+            decimals, name=ITEMS_TABLE, columns={"value": decimal_hint}, schema_contract=contract
+        )
+    )
+    pipeline.normalize()
+    pipeline.extract(
+        dlt.resource(
+            texts, name=ITEMS_TABLE, columns={"value": text_hint}, schema_contract=contract
+        )
+    )
+
+    expected = [(NEW_ITEMS_TABLE, text_hint, "VARCHAR(50)")]
+    if data_type_contract == "evolve":
+        expected.append((ITEMS_TABLE, text_hint, "VARCHAR(50)"))
+    else:
+        expected.append((ITEMS_TABLE, decimal_hint, "NUMBER(10,2)"))
+    mapper = snowflake().capabilities().get_type_mapper()
+    for table_name, hint, destination_type in expected:
+        table = pipeline.default_schema.get_table(table_name)
+        column = table["columns"]["value"]
+        assert column == {"name": "value", "nullable": True, **hint}
+        # a stale scale fails in VARCHAR(%i) with TypeError
+        assert (
+            mapper.to_destination_type(column, cast(PreparedTableSchema, table)) == destination_type
+        )
 
 
 TABLE_NAME_MAP = {"click": "click_events", "purchase": "purchase_events", "debug": "debug_events"}

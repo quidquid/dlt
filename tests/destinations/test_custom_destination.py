@@ -50,7 +50,6 @@ def _run_through_sink(
 
     @dlt.destination(loader_file_format=loader_file_format, batch_size=batch_size)
     def test_sink(items: TDataItems, table: TTableSchema) -> None:
-        nonlocal calls
         # convert pyarrow table to dict list here to make tests more simple downstream
         if loader_file_format == "parquet":
             items = items.to_pylist()  # type: ignore
@@ -58,7 +57,6 @@ def _run_through_sink(
 
     @dlt.resource(columns=columns, table_name="items")
     def items_resource() -> TDataItems:
-        nonlocal items
         yield items
 
     p = dlt.pipeline("sink_test", destination=test_sink, dev_mode=True)
@@ -129,7 +127,6 @@ global_calls: List[Tuple[TDataItems, TTableSchema]] = []
 
 
 def global_sink_func(items: TDataItems, table: TTableSchema) -> None:
-    global global_calls
     global_calls.append((items, table))
 
 
@@ -167,7 +164,6 @@ def test_instantiation() -> None:
 
     # NOTE: we also test injection of config vars here
     def local_sink_func(items: TDataItems, table: TTableSchema, my_val=dlt.config.value, /) -> None:
-        nonlocal calls
         assert my_val == "something"
         calls.append((items, table))
 
@@ -176,8 +172,20 @@ def test_instantiation() -> None:
     # test decorator
     calls = []
     p = dlt.pipeline("sink_test", destination=dlt.destination()(local_sink_func), dev_mode=True)
-    p.run([1, 2, 3], table_name="items")
+    info = p.run([1, 2, 3], table_name="items")
     assert len(calls) == 1
+    # a sink writes tables but has no dataset, so the trace records neither dataset name
+    location = next(
+        location
+        for metrics in info.metrics.values()
+        for location in metrics[0]["outputs"]
+        if location["resource_name"] == "items"
+    )
+    assert location["tables"] == ["items"]
+    assert "dataset_name" not in location and "physical_dataset_name" not in location
+    # nor a public location, it stays addressable by destination name
+    assert "location" not in location
+    assert location["destination_name"] == "local_sink_func"
     # local func does not create entry in destinations
     with pytest.raises(KeyError):
         DestinationReference.find("local_sink_func")
@@ -307,7 +315,6 @@ def test_instantiation() -> None:
 
     @dlt.destination
     def simple_decorator_sink(items, table, my_val=dlt.config.value):
-        nonlocal calls
         assert my_val == "something"
         calls.append((items, table))
 
@@ -399,7 +406,6 @@ def test_batched_transactions(loader_file_format: TLoaderFileFormat, batch_size:
         skip_dlt_columns_and_tables=False,
     )
     def test_sink(items: TDataItems, table: TTableSchema) -> None:
-        nonlocal calls
         table_name = table["name"]
         if table_name.startswith("_dlt"):
             return
@@ -743,7 +749,6 @@ def test_max_table_nesting(nesting: int) -> None:
 
     @dlt.destination(loader_file_format="typed-jsonl", max_table_nesting=nesting)
     def nesting_sink(items, table):
-        nonlocal found_tables
         found_tables.add(table["name"])
 
     @dlt.source(max_table_nesting=2)

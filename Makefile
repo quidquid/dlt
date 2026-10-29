@@ -1,7 +1,10 @@
 .DEFAULT_GOAL := help
-.PHONY: install-uv has-uv dev lint test test-common test-common-p reset-test-storage recreate-compiled-deps build-library-prerelease build-library publish-library test-load-local test-load-local-p test-load-local-postgres test-load-local-postgres-p install-snowflake-extras test-remote-snowflake test-remote-snowflake-p install-common-core test-common-core install-common-core-source test-common-core-source install-common-source install-pipeline-min test-pipeline-min install-pipeline-arrow test-pipeline-arrow install-pipeline-min-arrow test-pipeline-min-arrow install-workspace test-workspace test-workspace-dashboard install-hub-minimal test-hub-minimal test-hub install-pipeline-full test-pipeline-full install-pipeline-full-sql test-pipeline-full-sql install-sqlalchemy2 test-with-sqlalchemy-2 test-dest-load test-dest-remote-essential test-dest-remote-nonessential test-dbt-no-venv test-dbt-runner-venv test-sources-load test-sources-sql-database
+.PHONY: install-uv has-uv dev lint lint-emscripten test test-common test-common-p reset-test-storage recreate-compiled-deps build-library-prerelease build-library publish-library test-load-local test-load-local-p test-load-local-postgres test-load-local-postgres-p install-snowflake-extras test-remote-snowflake test-remote-snowflake-p install-common-core test-common-core install-common-core-source test-common-core-source install-common-source install-pipeline-min test-pipeline-min install-pipeline-arrow test-pipeline-arrow install-pipeline-min-arrow test-pipeline-min-arrow install-workspace test-workspace test-workspace-dashboard install-hub-minimal test-hub-minimal test-hub install-pipeline-full test-pipeline-full install-pipeline-full-sql test-pipeline-full-sql install-sqlalchemy2 test-with-sqlalchemy-2 test-dest-load test-dest-remote-essential test-dest-remote-nonessential test-dbt-no-venv test-dbt-runner-venv test-sources-load test-sources-sql-database
 
 PYV=$(shell python3 -c "import sys;t='{v[0]}.{v[1]}'.format(v=list(sys.version_info[:2]));sys.stdout.write(t)")
+
+# pyodide release used by lint-emscripten
+PYODIDE_VERSION ?= 0.28.3
 .SILENT:has-uv
 
 # read version from package
@@ -29,7 +32,7 @@ has-uv:
 	uv --version
 
 dev: has-uv ## Prepares development environment
-	uv sync --all-extras --no-extra hub --group workspace-deps --group dev --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group adbc --group dashboard-tests
+	uv sync --all-extras --no-extra hub --group workspace-deps --group dev --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group adbc --group dashboard-tests --group agent --group agent-claude
 
 dev-airflow: has-uv ## Prepares development environment with airflow support
 	uv sync --all-extras --no-extra hub --group workspace-deps --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group airflow
@@ -41,6 +44,12 @@ lint: lint-core lint-security lint-docstrings lint-lock lint-deps ## Runs all li
 
 lint-lock: ## Checks uv lockfile is in sync
 	uv lock --check
+
+lint-emscripten: ## Checks dlt imports in a pyodide (emscripten) VM (needs node, hits PyPI)
+	-@rm -rf dist
+	uv build --wheel --out-dir dist
+	npm install --no-save --no-audit --no-fund pyodide@$(PYODIDE_VERSION)
+	node tools/check_pyodide_import.mjs dist
 
 lint-deps: ## Checks dependencies, hub extras, and API breaking changes (informational)
 	-uv run python tools/check_hub_extras.py
@@ -93,13 +102,13 @@ PYTEST_XDIST_DIST  ?= worksteal
 PYTEST_TARGET_ARGS :=
 
 # Internal marker model
-PARALLEL_MARKER_EXPR = (not serial and not forked)
-SERIAL_MARKER_EXPR   = (serial or forked)
+PARALLEL_MARKER_EXPR = (not serial and not forked and not rfam)
+SERIAL_MARKER_EXPR   = (serial or forked) and not rfam
 
 ifeq ($(OS),Windows_NT)
   PYTEST_MARKERS += not forked and not rfam
   PYTEST_ARGS += -p no:forked
-  SERIAL_MARKER_EXPR = serial
+  SERIAL_MARKER_EXPR = serial and not rfam
 endif
 
 define COMBINE_MARKERS
@@ -225,7 +234,8 @@ TEST_COMMON_CORE_PATHS = \
 	tests/load/test_dummy_client.py \
 	tests/extract/test_extract.py \
 	tests/extract/test_sources.py \
-	tests/pipeline/test_pipeline_state.py
+	tests/pipeline/test_pipeline_state.py \
+	--ignore tests/normalize/test_normalize_arrow.py
 
 test-common-core:
 	$(call RUN_XDIST_SAFE_SPLIT,$(TEST_COMMON_CORE_PATHS))
@@ -257,7 +267,7 @@ test-pipeline-min:
 install-pipeline-arrow:
 	uv sync $(UV_SYNC_ARGS) --extra duckdb --extra cli --extra parquet
 
-TEST_PIPELINE_ARROW_PATHS = tests/pipeline/test_pipeline_extra.py
+TEST_PIPELINE_ARROW_PATHS = tests/pipeline/test_pipeline_extra.py tests/normalize/test_normalize_arrow.py
 
 test-pipeline-arrow: PYTEST_TARGET_ARGS = -k arrow
 test-pipeline-arrow:
@@ -268,12 +278,15 @@ test-pipeline-arrow:
 # ----------------------------------------------------------------------
 
 install-workspace:
-	uv sync $(UV_SYNC_ARGS) --group workspace-deps --extra cli --group streamlit
+	uv sync $(UV_SYNC_ARGS) --group workspace-deps --extra cli --group streamlit --group agent --group agent-claude
 
-TEST_WORKSPACE_PATHS = tests/workspace
+TEST_WORKSPACE_PATHS = tests/workspace --ignore tests/workspace/deployment/test_agent_e2e.py
 
 test-workspace:
 	$(call RUN_XDIST_SAFE_SPLIT,$(TEST_WORKSPACE_PATHS))
+
+test-workspace-agents: ## Runs agents on real loops and models (needs jobs.agent.api_key in tests/.dlt/secrets.toml)
+	$(PYTEST_BASE) tests/workspace/deployment/test_agent_e2e.py
 
 # ----------------------------------------------------------------------
 # CI: hub minimal (no ibis)
@@ -317,8 +330,9 @@ TEST_FULL_PATHS = \
 test-pipeline-full:
 	$(call RUN_XDIST_SAFE_SPLIT,$(TEST_FULL_PATHS))
 
+# sqlalchemy 2.1 defaults postgresql:// to psycopg 3, which the postgres extra does not install
 install-sqlalchemy2:
-	uv run pip install sqlalchemy==2.0.32
+	uv run pip install --upgrade "sqlalchemy>=2.0.18,<2.1"
 
 TEST_SQL_DATABASE_PATHS = tests/sources/sql_database tests/common/libs/
 
@@ -417,12 +431,6 @@ start-test-containers: ## Starts docker containers for local testing (postgres, 
 	docker compose -f "tests/load/filesystem_sftp/docker-compose.yml" up -d
 	docker compose -f "tests/load/sqlalchemy/docker-compose.yml" up -d
 	docker compose -f "tests/load/clickhouse/docker-compose.yml" up -d
-
-update-cli-docs: ## Regenerates CLI reference docs
-	uv run python docs/tools/check_cli_docs.py docs/website/docs/reference/command-line-interface.md
-
-check-cli-docs: ## Checks CLI reference docs are up to date (CI)
-	uv run python docs/tools/check_cli_docs.py docs/website/docs/reference/command-line-interface.md --compare
 
 test-e2e-dashboard: ## Runs dashboard e2e tests with headless chromium
 	uv run pytest --browser chromium tests/e2e

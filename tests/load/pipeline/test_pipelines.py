@@ -377,6 +377,15 @@ def test_skip_sync_schema_for_tables_without_columns(
         exists, _ = job_client.get_storage_table("data_table")  # type: ignore[attr-defined]
         assert not exists
 
+        # a table dropped in the destination comes back only with a forced sync
+        job_client.drop_tables(schema.loads_table_name, delete_schema=False)  # type: ignore[attr-defined]
+    assert p.sync_schema() == {}
+    with p._get_destination_clients(schema)[0] as job_client:
+        assert job_client.get_storage_table(schema.loads_table_name)[0] is False  # type: ignore[attr-defined]
+    assert schema.loads_table_name in p.sync_schema(force=True)
+    with p._get_destination_clients(schema)[0] as job_client:
+        assert job_client.get_storage_table(schema.loads_table_name)[0] is True  # type: ignore[attr-defined]
+
 
 @pytest.mark.essential
 @pytest.mark.parametrize(
@@ -525,6 +534,7 @@ def test_evolve_schema(destination_config: DestinationTestConfiguration) -> None
     # lets violate unique constraint on postgres, redshift and BQ ignore unique indexes
     if destination_config.destination_type == "postgres":
         # let it complete even with PK violation (which is a teminal error)
+        os.environ["LOAD__AUTO_ABORT_ON_TERMINAL_ERROR"] = "false"
         os.environ["RAISE_ON_FAILED_JOBS"] = "false"
         assert p.dataset_name == dataset_name
         err_info = p.run(
@@ -680,7 +690,6 @@ def test_parquet_loading(destination_config: DestinationTestConfiguration) -> No
         "synapse",
         "databricks",
         "clickhouse",
-        "fabric",
     ]:
         datetime_data.pop("col11")
         datetime_data.pop("col11_null")
@@ -707,8 +716,6 @@ def test_parquet_loading(destination_config: DestinationTestConfiguration) -> No
         columns=columns_schema,
     )
     def my_resource():
-        nonlocal datetime_data
-
         start_idx = cast(int, datetime_data["col1"])
         for idx, item in enumerate([datetime_data] * 10):
             item = deepcopy(item)
@@ -1098,11 +1105,11 @@ def test_dest_column_hint_timezone(destination_config: DestinationTestConfigurat
                     "timestamp_values": output_values,
                 },
                 "EVENTS_TIMEZONE_ON": {
-                    "timestamp_type": "TIMESTAMP_TZ",
+                    "timestamp_type": "TIMESTAMP_LTZ",
                     "timestamp_values": output_values,
                 },
                 "EVENTS_TIMEZONE_UNSET": {
-                    "timestamp_type": "TIMESTAMP_TZ",
+                    "timestamp_type": "TIMESTAMP_LTZ",
                     "timestamp_values": output_values,
                 },
             },
@@ -1281,7 +1288,6 @@ def test_pipeline_with_named_destination_via_factory_initializer() -> None:
     calls: List[Tuple[TDataItems, TTableSchema]] = []
 
     def local_sink_func(items: TDataItems, table: TTableSchema, my_val=dlt.config.value, /) -> None:
-        nonlocal calls
         assert my_val == "something"
         calls.append((items, table))
 

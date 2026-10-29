@@ -9,12 +9,15 @@ from dlt.common.configuration.specs.base_configuration import (
     CredentialsConfiguration,
     NotResolved,
 )
-from dlt.common.destination.client import DestinationClientDwhConfiguration
-from dlt.common.pendulum import timedelta
+from dlt.common.destination.client import (
+    DestinationClientConfiguration,
+    DestinationClientDwhConfiguration,
+    WithAttachableEngine,
+)
+from datetime import timedelta
 from dlt.common.storages.configuration import FilesystemConfiguration, WithLocalFiles
 from dlt.common.typing import TSecretStrValue, Annotated
 from dlt.common.utils import digest128
-
 from dlt.destinations.impl.lancedb.warnings import uri_on_credentials_deprecated
 
 if TYPE_CHECKING:
@@ -111,7 +114,9 @@ TEmbeddingProvider = Literal[
 
 
 @configspec
-class LanceDBClientConfiguration(WithLocalFiles, DestinationClientDwhConfiguration):
+class LanceDBClientConfiguration(
+    WithAttachableEngine, WithLocalFiles, DestinationClientDwhConfiguration
+):
     destination_type: Final[str] = dataclasses.field(  # type: ignore
         default="lancedb", init=False, repr=False, compare=False
     )
@@ -129,6 +134,8 @@ class LanceDBClientConfiguration(WithLocalFiles, DestinationClientDwhConfigurati
     dataset_name: Final[Optional[str]] = dataclasses.field(  # type: ignore
         default=None, init=False, repr=False, compare=False
     )
+    always_refresh_views: bool = False
+    """Recreates view before each query to it"""
 
     options: Optional[LanceDBClientOptions] = None
     """LanceDB client options."""
@@ -191,8 +198,36 @@ class LanceDBClientConfiguration(WithLocalFiles, DestinationClientDwhConfigurati
         self.credentials.uri = self.lance_uri
 
     def fingerprint(self) -> str:
-        """Returns a fingerprint of a connection string."""
-
+        """Returns a fingerprint of the LanceDB URI."""
         if self.lance_uri:
             return digest128(self.lance_uri)
         return ""
+
+    def data_location(self) -> str:
+        """Returns the resolved LanceDB URI, or the identity of an external client."""
+        if not self.lance_uri:
+            self._no_data_location("the configuration has no `lance_uri`")
+        if self.lance_uri == ":external:":
+            # the marker identifies no database, so the client that holds it is the only identity.
+            # `on_resolved` sets the marker when the credentials are the client. the credentials
+            # spec sets it when the spec wraps a client in `_conn`
+            client = getattr(self.credentials, "_conn", None) or self.credentials
+            return f":external:{hex(id(client))}"
+
+        if self.lance_uri.startswith("db://"):
+            region = self.credentials.region if self.credentials else None
+            host_override = self.credentials.host_override if self.credentials else None
+            endpoint_parts = [self.lance_uri]
+            if region:
+                endpoint_parts.append(region)
+            if host_override:
+                endpoint_parts.append(host_override)
+            return "|".join(endpoint_parts)
+
+        return self.lance_uri
+
+    def can_write_from(self, other: DestinationClientConfiguration) -> bool:
+        """LanceDB does not have an engine that can write. `dlt` is that engine,
+        and returning False here enforces its usage.
+        """
+        return False

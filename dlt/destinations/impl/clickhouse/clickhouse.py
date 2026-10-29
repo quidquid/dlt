@@ -1,6 +1,6 @@
 from copy import deepcopy
 from textwrap import dedent
-from typing import Any, Dict, Literal, Optional, List, Sequence, cast
+from typing import Any, Dict, Iterable, Literal, Optional, List, Sequence, cast
 from urllib.parse import ParseResult, urlparse
 
 import clickhouse_connect
@@ -31,6 +31,8 @@ from dlt.common.schema.utils import (
 from dlt.common.storages import FileStorage
 from dlt.common.storages.configuration import FilesystemConfiguration, ensure_canonical_az_url
 from dlt.common.storages.fsspec_filesystem import AZURE_BLOB_STORAGE_PROTOCOLS
+from dlt.common.storages.load_package import ParsedLoadJobFileName
+from dlt.common.destination.exceptions import DestinationTerminalException
 from dlt.destinations.exceptions import LoadJobTerminalException
 from dlt.destinations.impl.clickhouse.configuration import (
     ClickHouseClientConfiguration,
@@ -38,6 +40,7 @@ from dlt.destinations.impl.clickhouse.configuration import (
 from dlt.destinations.impl.clickhouse.sql_client import ClickHouseSqlClient
 from dlt.destinations.impl.clickhouse.typing import (
     CODEC_HINT,
+    EXCHANGE_CAPABLE_DATABASE_ENGINES,
     HINT_TO_CLICKHOUSE_ATTR,
     PARTITION_HINT,
     LOW_CARDINALITY_HINT,
@@ -63,7 +66,7 @@ from dlt.destinations.job_client_impl import (
 )
 from dlt.destinations.job_impl import ReferenceFollowupJobRequest
 from dlt.destinations.sql_client import SqlClientBase
-from dlt.destinations.sql_jobs import SqlMergeFollowupJob
+from dlt.destinations.sql_jobs import SqlMergeFollowupJob, SqlStagingReplaceFollowupJob
 from dlt.destinations.utils import get_deterministic_temp_table_name
 from dlt.destinations.path_utils import get_file_format_and_compression
 
@@ -269,7 +272,11 @@ class ClickHouseMergeJob(SqlMergeFollowupJob):
         primary_keys: Sequence[str],
         merge_keys: Sequence[str],
         for_delete: bool,
+        source_filter: Optional[str] = None,
     ) -> List[str]:
+        staging_rows = staging_root_table_name
+        if source_filter:
+            staging_rows = f"(SELECT * FROM {staging_root_table_name} WHERE {source_filter})"
         if for_delete:
             # ClickHouse lightweight DELETE doesn't support table aliases or
             # correlated subqueries with qualified column references.
@@ -279,22 +286,57 @@ class ClickHouseMergeJob(SqlMergeFollowupJob):
                     col_tuple = ", ".join(cols)
                     sql.append(
                         f"FROM {root_table_name} WHERE ({col_tuple}) IN"
-                        f" (SELECT {col_tuple} FROM {staging_root_table_name})"
+                        f" (SELECT {col_tuple} FROM {staging_rows})"
                     )
             return sql
         key_clauses = cls._gen_key_table_clauses(primary_keys, merge_keys)
         join_conditions = " OR ".join([c.format(d="d", s="s") for c in key_clauses])
-        return [
-            f"FROM {root_table_name} AS d JOIN {staging_root_table_name} AS s ON {join_conditions}"
-        ]
+        return [f"FROM {root_table_name} AS d JOIN {staging_rows} AS s ON {join_conditions}"]
 
     @classmethod
     def gen_update_table_prefix(cls, table_name: str) -> str:
         return f"ALTER TABLE {table_name} UPDATE"
 
     @classmethod
+    def gen_merge_key_present_clause(
+        cls,
+        table_name: str,
+        staging_root_table_name: str,
+        merge_keys: Sequence[str],
+        sql_client: SqlClientBase[Any],
+        source_filter: Optional[str] = None,
+    ) -> Optional[str]:
+        # mutations do not support correlated subqueries
+        if not merge_keys:
+            return None
+        return cls._gen_keys_in_staging_cond(staging_root_table_name, merge_keys, source_filter)
+
+    @classmethod
     def requires_temp_table_for_delete(cls) -> bool:
         return False
+
+
+class ClickHouseStagingReplaceJob(SqlStagingReplaceFollowupJob):
+    """Atomic staging-optimized replace via `EXCHANGE TABLES`.
+
+    Requires the destination database to use the `Atomic`, `Replicated` or `Shared` engine.
+    The previous destination data lands in the staging slot after the swap; dlt
+    truncates staging tables at the start of the next load.
+    """
+
+    @classmethod
+    def generate_sql(
+        cls,
+        table_chain: Sequence[PreparedTableSchema],
+        sql_client: SqlClientBase[Any],
+    ) -> List[str]:
+        sql: List[str] = []
+        for table in table_chain:
+            with sql_client.with_staging_dataset():
+                staging_table_name = sql_client.make_qualified_table_name(table["name"])
+            table_name = sql_client.make_qualified_table_name(table["name"])
+            sql.append(f"EXCHANGE TABLES {staging_table_name} AND {table_name}")
+        return sql
 
 
 class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestination):
@@ -348,6 +390,42 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
         self, table_chain: Sequence[PreparedTableSchema]
     ) -> List[FollowupJobRequest]:
         return [ClickHouseMergeJob.from_table_chain(table_chain, self.sql_client)]
+
+    def _create_replace_followup_jobs(
+        self, table_chain: Sequence[PreparedTableSchema]
+    ) -> List[FollowupJobRequest]:
+        root_table = table_chain[0]
+        if root_table["x-replace-strategy"] == "staging-optimized":  # type: ignore[typeddict-item]
+            return [ClickHouseStagingReplaceJob.from_table_chain(table_chain, self.sql_client)]
+        return super()._create_replace_followup_jobs(table_chain)
+
+    def verify_schema(
+        self,
+        only_tables: Iterable[str] = None,
+        new_jobs: Iterable[ParsedLoadJobFileName] = None,
+    ) -> List[PreparedTableSchema]:
+        loaded_tables = super().verify_schema(only_tables, new_jobs)
+        # probe the database engine early so staging-optimized fails fast at init,
+        # before any data is extracted or loaded into staging
+        if any(table.get("x-replace-strategy") == "staging-optimized" for table in loaded_tables):
+            self._verify_database_supports_exchange()
+        return loaded_tables
+
+    def _verify_database_supports_exchange(self) -> None:
+        # `Replicated` derives from `Atomic` and supports EXCHANGE, but reports its own engine
+        # name in system.databases, so every exchange-capable engine must be listed explicitly
+        result = self.sql_client.execute_sql(
+            "SELECT engine FROM system.databases WHERE name = currentDatabase()"
+        )
+        engine = result[0][0] if result else "unknown"
+        if engine not in EXCHANGE_CAPABLE_DATABASE_ENGINES:
+            supported = " or ".join(EXCHANGE_CAPABLE_DATABASE_ENGINES)
+            raise DestinationTerminalException(
+                f"ClickHouse replace_strategy='staging-optimized' requires the {supported}"
+                f" database engine to use EXCHANGE TABLES (current: {engine}). Either choose"
+                " 'insert-from-staging' or 'truncate-and-insert', or recreate the database with"
+                " ENGINE = Atomic."
+            )
 
     def _get_column_def_sql(self, c: TColumnSchema, table: PreparedTableSchema = None) -> str:
         # Build column definition.
@@ -475,6 +553,8 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
         engine_name = TABLE_ENGINE_TYPE_TO_CLICKHOUSE_ATTR.get(table_type)
         sql[0] = f"{sql[0]}\nENGINE = {engine_name}{engine_params}"
 
+        sort_key = self._get_key(table, "sort")
+
         # PRIMARY KEY
         if primary_key_list := [
             self.sql_client.escape_column_name(c["name"])
@@ -482,11 +562,12 @@ class ClickHouseClient(SqlJobClientWithStagingDataset, SupportsStagingDestinatio
             if c.get("primary_key")
         ]:
             sql[0] += "\nPRIMARY KEY (" + ", ".join(primary_key_list) + ")"
-        else:
+        elif not sort_key:
+            # an explicit empty primary key would override the index ClickHouse derives from ORDER BY
             sql[0] += "\nPRIMARY KEY tuple()"
 
         # ORDER BY
-        if sort_key := self._get_key(table, "sort"):
+        if sort_key:
             sql[0] += f"\nORDER BY {sort_key}"
 
         # PARTITION BY
